@@ -10,5 +10,9 @@ eval:
 visualization:
   show_speed_direction: True
   speed_window_frames: 4
+  direction_window_frames: 1
   speed_smoothing_alpha: 0.35
+  direction_change_threshold_deg: 110
+  direction_min_distance_m: 0.01
+  direction_stabilization_frames: 1
   hud_position: top_center
