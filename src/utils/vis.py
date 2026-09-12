@@ -77,7 +77,7 @@ _NOMINAL_FPS = (
 )
 
 
-def normalize_video_fps(fps: float, tolerance: float = 0.01) -> float:
+def normalize_video_fps(fps: float, tolerance: float = 0.5) -> float:
     """Return a sane nominal FPS for video output.
 
     Some MOV/MP4 containers expose FPS values such as 240.229 because of a
