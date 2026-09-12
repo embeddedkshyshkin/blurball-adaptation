@@ -7,3 +7,9 @@ vis_traj: False
 model_path: 
 eval:
   score_threshold: 0.5
+visualization:
+  show_speed_direction: True
+  speed_meters_per_pixel: null
+  speed_window_frames: 4
+  speed_smoothing_alpha: 0.35
+  hud_position: top_center
