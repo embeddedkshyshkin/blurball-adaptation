@@ -12,4 +12,6 @@ hydra:
   run:
     dir: ${WASB_ROOT}/outputs/${hydra.job.name}/${now:%Y-%m-%d_%H-%M-%S}
 output_dir:
+input_vid:
+calibration_file:
 seed: 1234
