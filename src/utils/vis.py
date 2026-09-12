@@ -10,7 +10,9 @@ from utils import Center
 
 
 def draw_frame(img_or_path, center: Center, color: Tuple, radius: int = 5, thickness: int = -1, angle=None, l=None):
-    if osp.isfile(img_or_path):
+    if isinstance(img_or_path, np.ndarray):
+        img = img_or_path
+    elif isinstance(img_or_path, (str, bytes, os.PathLike)) and osp.isfile(img_or_path):
         img = cv2.imread(img_or_path)
     else:
         img = img_or_path
