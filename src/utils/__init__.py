@@ -12,7 +12,7 @@ from .heatmap import gen_heatmap, gen_binary_map, gen_line_binary_map, gen_line_
 from .dataclasses import Center
 from .file import load_csv_tennis
 from .refine_gt import refine_gt_clip_tennis
-from .vis import draw_frame, gen_video
+from .vis import draw_frame, draw_speed_direction_hud, gen_video
 from .evaluator import Evaluator
 from .blur_evaluator import BlurEvaluator
 from .preprocess import process_video
