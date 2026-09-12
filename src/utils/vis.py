@@ -31,18 +31,19 @@ def draw_frame(img_or_path, center: Center, color: Tuple, radius: int = 5, thick
     return img
 
 
-def draw_speed_direction_hud(img, speed_kmh: Optional[float], angle_rad: Optional[float], position="top_center", arrow_length=70):
-    """Draw a rotating direction arrow and current ball speed."""
-    if speed_kmh is None or angle_rad is None:
-        return img
+def draw_speed_direction_hud(img, speed_kmh: float = 0.0, angle_rad: Optional[float] = None, position="top_center", arrow_length=70):
+    """Draw the current ball speed and, when reliable, the movement direction."""
     h, w = img.shape[:2]
     cx, cy = w // 2, 55 if position == "top_center" else 55
-    half = arrow_length * 0.5
-    x1 = int(cx - half * np.cos(angle_rad))
-    y1 = int(cy - half * np.sin(angle_rad))
-    x2 = int(cx + half * np.cos(angle_rad))
-    y2 = int(cy + half * np.sin(angle_rad))
-    cv2.arrowedLine(img, (x1, y1), (x2, y2), (0, 255, 255), 4, tipLength=0.3)
+
+    if angle_rad is not None:
+        half = arrow_length * 0.5
+        x1 = int(cx - half * np.cos(angle_rad))
+        y1 = int(cy - half * np.sin(angle_rad))
+        x2 = int(cx + half * np.cos(angle_rad))
+        y2 = int(cy + half * np.sin(angle_rad))
+        cv2.arrowedLine(img, (x1, y1), (x2, y2), (0, 255, 255), 4, tipLength=0.3)
+
     label = f"{speed_kmh:.0f} km/h"
     font = cv2.FONT_HERSHEY_SIMPLEX
     scale, thickness = 1.0, 2
