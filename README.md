@@ -69,8 +69,6 @@ Set hydra environment variable:
 ```bash
 export HYDRA_FULL_ERROR=1
 ```
-```
-```
 
 ## Evaluation
 Once the weights and dataset are downloaded, you can evaluate the different models as follows:
@@ -99,16 +97,33 @@ BlurBall uses a multi-frame MIMO setup and is sensitive to duplicated frames (co
 Run inference on a video:
 
 ```
-python main.py --config-name=inference_<model> detector.model_path=<path to corresponding model> +input_vid=<path to vid>
+python src/main.py --config-name=inference_<model> detector.model_path=<path to corresponding model> +input_vid=<path to vid>
 ```
+
+For the speed/direction visualization, provide the PongEye calibration JSON together with the video:
+
+```
+python src/main.py <path_to_video> <path_to_calibration.json> --config-name=inference_blurball detector.model_path=<path to corresponding model>
+```
+
+The calibration JSON must contain the calibrated table corners and table dimensions. An example is provided at:
+
+```
+examples/pongeye_calibration.json
+```
+
+The visualization displays the detected ball, a continuously rotating direction arrow, and the current calibrated table-plane speed in km/h in the upper-center HUD. Speed is calculated using the source video's FPS and the image-to-table homography derived from the calibration corners.
 
 ### BlurBall parameters
 - Step size: trade off between accuracy and speed
 - Score threshold: recommended 0.7 for 1-step inference
+- Speed/direction HUD: enabled by default for this adaptation
+- Speed smoothing window: 4 frames
+- Speed smoothing factor: 0.35
 
 Example:
 ```
-python main.py --config-name=inference_blurball detector.model_path=<path to corresponding model> +input_vid=<path to vid> detector.step=1 detector.postprocessor.score_threshold=0.7
+python src/main.py <path_to_video> <path_to_calibration.json> --config-name=inference_blurball detector.model_path=<path to corresponding model> detector.step=1 detector.postprocessor.score_threshold=0.7
 ```
 
 ## Training
@@ -134,3 +149,4 @@ If you use this work, please cite:
   journal = {Proceedings of the IEEE/CVF Conference on Computer Vision and Pattern Recognition (CVPR) Workshops},
   year    = {2026}
 }
+```
