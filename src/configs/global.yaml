@@ -1,1 +1,3 @@
-WASB_ROOT: /home/gossard/Git/blurball
+# Repository root is resolved from the directory where Hydra was launched.
+# This keeps the configuration portable across machines.
+WASB_ROOT: ${hydra:runtime.cwd}
