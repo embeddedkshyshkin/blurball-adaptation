@@ -1,0 +1,34 @@
+{
+  "calibration": {
+    "ballAppearanceProfile": {
+      "orangeHue": { "lower": 19.105859071893256, "upper": 30.19354294143174 },
+      "orangeSaturation": { "lower": 0.4542157755607007, "upper": 0.9745758819031844 },
+      "orangeValue": { "lower": 0.5636470848321915, "upper": 1.0418431347608568 },
+      "sampleCount": 116,
+      "whiteSaturation": { "lower": 0.12430378824087, "upper": 0.2309425134005447 },
+      "whiteValue": { "lower": 0.7781960916519166, "upper": 0.9535686302185058 }
+    },
+    "balls": [
+      { "id": 0, "position": { "x": 1094.4978737997258, "y": 524.4236625514403 }, "radiusPx": 8.371162945889834 },
+      { "id": 1, "position": { "x": 1274.482414874552, "y": 482.52491039426525 }, "radiusPx": 7.32384477228583 },
+      { "id": 2, "position": { "x": 746.1504166666666, "y": 482.7199074074074 }, "radiusPx": 5.094527531128067 },
+      { "id": 3, "position": { "x": 801.2879310344829, "y": 552.4542624521073 }, "radiusPx": 5.008899121221593 }
+    ],
+    "corners": {
+      "bottomLeft": { "x": 357.4304559863121, "y": 649.0728002386243 },
+      "bottomRight": { "x": 1527.452786835531, "y": 656.5127747812209 },
+      "topLeft": { "x": 626.8941605990358, "y": 455.3948632975162 },
+      "topRight": { "x": 1268.2298965489329, "y": 463.7787202509803 }
+    },
+    "tableDimensions": { "lengthMeters": 2.74, "widthMeters": 1.525 }
+  },
+  "calibrationFrame": { "frameIndex": 0, "timestampSec": 0 },
+  "device": {
+    "gravity": { "x": -0.9200862050056458, "y": 0.015423724427819252, "z": -0.39141198992729187 },
+    "interfaceOrientation": "landscapeRight",
+    "quaternion": { "w": 0.8340898105109897, "x": -0.009083974361072587, "y": -0.5515537072052461, "z": 0.0002447848352972739 },
+    "referenceFrame": "xArbitraryCorrectedZVertical"
+  },
+  "sessionId": "54DE6ED0-7815-41E5-AA6B-6ED32EC673D1",
+  "stillFileName": "calibration_frame.jpg"
+}
