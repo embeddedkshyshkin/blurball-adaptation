@@ -9,7 +9,6 @@ eval:
   score_threshold: 0.5
 visualization:
   show_speed_direction: True
-  calibration_file: examples/pongeye_calibration.json
   speed_window_frames: 4
   speed_smoothing_alpha: 0.35
   hud_position: top_center
