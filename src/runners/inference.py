@@ -64,8 +64,7 @@ def load_speed_calibration(calibration_file):
         dtype=np.float32,
     )
 
-    homography = cv2.getPerspectiveTransform(image_points, table_points)
-    return homography
+    return cv2.getPerspectiveTransform(image_points, table_points)
 
 
 def project_to_table(point_xy, homography):
@@ -160,13 +159,17 @@ def inference_video(
 
     vis_cfg = cfg.get("runner", {}).get("visualization", {})
     show_speed_direction = bool(vis_cfg.get("show_speed_direction", False))
-    calibration_file = vis_cfg.get("calibration_file", None)
+    calibration_file = cfg.get("calibration_file", None)
     speed_window = max(1, int(vis_cfg.get("speed_window_frames", 4)))
     smoothing_alpha = float(vis_cfg.get("speed_smoothing_alpha", 0.35))
     hud_position = vis_cfg.get("hud_position", "top_center")
 
     speed_homography = None
-    if show_speed_direction and calibration_file:
+    if show_speed_direction:
+        if not calibration_file:
+            raise ValueError(
+                "Speed/direction visualization requires +calibration_file=<PongEye calibration JSON>"
+            )
         speed_homography = load_speed_calibration(calibration_file)
         print("Loaded PongEye calibration from " + str(calibration_file))
 
@@ -193,10 +196,7 @@ def inference_video(
         current_direction_rad = None
         if show_speed_direction and visi_pred:
             current_position = (float(x_pred), float(y_pred))
-            if speed_homography is not None:
-                table_position = project_to_table(current_position, speed_homography)
-            else:
-                table_position = current_position
+            table_position = project_to_table(current_position, speed_homography)
 
             recent_positions.append((cnt, current_position, table_position))
             if len(recent_positions) > speed_window + 1:
@@ -220,8 +220,6 @@ def inference_video(
                             )
                         current_speed_kmh = smoothed_speed_kmh
 
-                    # The arrow is rendered in image coordinates so it points
-                    # along the visible ball trajectory in the video.
                     dx_image = current_position[0] - first_image_pos[0]
                     dy_image = current_position[1] - first_image_pos[1]
                     if np.hypot(dx_image, dy_image) > 0:
