@@ -100,10 +100,10 @@ Run inference on a video:
 python src/main.py --config-name=inference_<model> detector.model_path=<path to corresponding model> +input_vid=<path to vid>
 ```
 
-For the speed/direction visualization, provide the PongEye calibration JSON together with the video:
+For the speed/direction visualization, use the same Hydra CLI style and additionally provide the PongEye calibration JSON:
 
 ```
-python src/main.py <path_to_video> <path_to_calibration.json> --config-name=inference_blurball detector.model_path=<path to corresponding model>
+python src/main.py --config-name=inference_blurball detector.model_path=<path to corresponding model> +input_vid=<path_to_video> +calibration_file=<path_to_calibration.json>
 ```
 
 The calibration JSON must contain the calibrated table corners and table dimensions. An example is provided at:
@@ -123,7 +123,7 @@ The visualization displays the detected ball, a continuously rotating direction 
 
 Example:
 ```
-python src/main.py <path_to_video> <path_to_calibration.json> --config-name=inference_blurball detector.model_path=<path to corresponding model> detector.step=1 detector.postprocessor.score_threshold=0.7
+python src/main.py --config-name=inference_blurball detector.model_path=<path to corresponding model> detector.step=1 detector.postprocessor.score_threshold=0.7 +input_vid=<path_to_video> +calibration_file=<path_to_calibration.json>
 ```
 
 ## Training
