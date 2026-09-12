@@ -16,25 +16,15 @@ import numpy as np
 import torch
 from torch import nn
 import cv2
-import matplotlib.pyplot as plt
 
 from dataloaders import build_dataloader
 from detectors import build_detector
 from trackers import build_tracker
-from utils import mkdir_if_missing, draw_frame, gen_video, Center, Evaluator
+from utils import mkdir_if_missing, draw_frame, draw_speed_direction_hud, gen_video, Center, Evaluator
 from utils.image import get_affine_transform, affine_transform
 from utils.preprocess import process_video
 
 from .base import BaseRunner
-
-
-# # Build the dataloader
-# transform_train = T.Compose(
-#     [
-#         T.ToTensor(),
-#         T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-#     ]
-# )
 
 
 @torch.no_grad()
@@ -51,8 +41,6 @@ def inference_video(
 ):
     frames_in = detector.frames_in
     frames_out = detector.frames_out
-
-    # +---------------
     t_start = time.time()
 
     det_results = []
@@ -60,28 +48,19 @@ def inference_video(
     num_frames = 0
     print("Starting********")
 
-    # Get all frames
     imgs_paths = sorted(Path(frame_dir).glob("*.png"))
-
     cap = cv2.VideoCapture(str(input_video_path))
-
-    fps = int(cap.get(cv2.CAP_PROP_FPS))
+    fps = cap.get(cv2.CAP_PROP_FPS)
     w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     cap.release()
+    if not fps or fps <= 0:
+        raise ValueError("Could not determine source video FPS")
+
     c = np.array([w / 2.0, h / 2.0], dtype=np.float32)
     s = max(h, w) * 1.0
     trans = np.stack(
-        [
-            get_affine_transform(
-                c,
-                s,
-                0,
-                [cfg["model"]["inp_width"], cfg["model"]["inp_height"]],
-                inv=1,
-            )
-            for _ in range(3)
-        ],
+        [get_affine_transform(c, s, 0, [cfg["model"]["inp_width"], cfg["model"]["inp_height"]], inv=1) for _ in range(3)],
         axis=0,
     )
     trans = torch.tensor(trans)[None, :]
@@ -99,20 +78,13 @@ def inference_video(
     img_paths_buffer = []
     frames_buffer = []
     for img_path in imgs_paths:
-        # cv2.imshow("test", frame)
-        # cv2.waitKey(1)
-        # num_frames += imgs.shape[0] * frames_in
         frame = cv2.imread(str(img_path))
         frames_buffer.append(frame)
         img_paths_buffer.append(str(img_path))
         if len(frames_buffer) == cfg["model"]["frames_in"]:
-            # Preprocess the frames
             frames_processed = [preprocess_frame(f) for f in frames_buffer]
-            input_tensor = torch.cat(frames_processed, dim=0).unsqueeze(
-                0
-            )  # .to(device)
+            input_tensor = torch.cat(frames_processed, dim=0).unsqueeze(0)
             batch_results, hms_vis = detector.run_tensor(input_tensor, trans)
-
             for ie in batch_results[0].keys():
                 path = img_paths_buffer[ie]
                 preds = batch_results[0][ie]
@@ -132,19 +104,23 @@ def inference_video(
         result_dict[img_path] = tracker.update(preds)
     print("Finished tracking")
 
-    # print(result_dict)
     t_elapsed = time.time() - t_start
-    # +---------------
-
     cm_pred = plt.get_cmap("Reds", len(result_dict))
 
     x_fin, y_fin, vis_fin = [], [], []
     if cfg["model"]["name"] == "blurball":
-        l_fin, theta_fin = ([], [])
+        l_fin, theta_fin = [], []
 
-    cnt = 0
+    vis_cfg = cfg.get("runner", {}).get("visualization", {})
+    show_speed_direction = bool(vis_cfg.get("show_speed_direction", False))
+    meters_per_pixel = vis_cfg.get("speed_meters_per_pixel", None)
+    speed_window = max(1, int(vis_cfg.get("speed_window_frames", 4)))
+    smoothing_alpha = float(vis_cfg.get("speed_smoothing_alpha", 0.35))
+    hud_position = vis_cfg.get("hud_position", "top_center")
+    recent_positions = []
+    smoothed_speed_kmh = None
+
     for cnt, img_path in enumerate(result_dict.keys()):
-        # xy_pred = (result_dict[cnt]["x"], result_dict[cnt]["y"])
         x_pred = result_dict[img_path]["x"]
         y_pred = result_dict[img_path]["y"]
         visi_pred = result_dict[img_path]["visi"]
@@ -153,7 +129,6 @@ def inference_video(
             angle_pred = result_dict[img_path]["angle"]
             length_pred = result_dict[img_path]["length"]
 
-        # Save the predictions
         x_fin.append(int(min(max(x_pred, 0), 100000)))
         y_fin.append(int(min(max(y_pred, 0), 100000)))
         vis_fin.append(int(visi_pred))
@@ -161,137 +136,88 @@ def inference_video(
             theta_fin.append(angle_pred)
             l_fin.append(length_pred)
 
-        # cv2.imshow("test", 250 * hm_results[img_path][0]["hm"])
-        # cv2.waitKey(800)
+        current_speed_kmh = None
+        current_direction_rad = None
+        if show_speed_direction and visi_pred:
+            recent_positions.append((cnt, float(x_pred), float(y_pred)))
+            if len(recent_positions) > speed_window + 1:
+                recent_positions.pop(0)
+            if len(recent_positions) >= 2:
+                first_frame, first_x, first_y = recent_positions[0]
+                dt = (cnt - first_frame) / fps
+                dx = float(x_pred) - first_x
+                dy = float(y_pred) - first_y
+                distance_px = float(np.hypot(dx, dy))
+                if dt > 0 and distance_px > 0:
+                    current_direction_rad = float(np.arctan2(dy, dx))
+                    speed_px_s = distance_px / dt
+                    if meters_per_pixel is not None and float(meters_per_pixel) > 0:
+                        raw_speed_kmh = speed_px_s * float(meters_per_pixel) * 3.6
+                        if smoothed_speed_kmh is None:
+                            smoothed_speed_kmh = raw_speed_kmh
+                        else:
+                            smoothed_speed_kmh = smoothing_alpha * raw_speed_kmh + (1.0 - smoothing_alpha) * smoothed_speed_kmh
+                        current_speed_kmh = smoothed_speed_kmh
 
         if vis_frame_dir is not None:
-            vis_frame_path = (
-                osp.join(vis_frame_dir, osp.basename(img_path))
-                if vis_frame_dir is not None
-                else None
-            )
-            hm_path = (
-                osp.join(vis_hm_dir, osp.basename(img_path))
-                if vis_frame_dir is not None
-                else None
-            )
-            vis_gt = cv2.imread(img_path)
+            vis_frame_path = osp.join(vis_frame_dir, osp.basename(img_path))
+            hm_path = osp.join(vis_hm_dir, osp.basename(img_path))
             vis_pred = cv2.imread(img_path)
 
-            for cnt2, img_path2 in enumerate(result_dict.keys()):
-                if cnt2 != cnt:
-                    continue
-                if cnt2 > cnt:
-                    break
+            color_pred = (255, 0, 0)
+            if cfg["model"]["name"] == "blurball":
+                vis_pred = draw_frame(
+                    vis_pred,
+                    center=Center(is_visible=visi_pred, x=x_pred, y=y_pred),
+                    color=color_pred,
+                    radius=3,
+                    angle=angle_pred,
+                    l=length_pred,
+                )
+                vis_hm_pred = cv2.cvtColor((255 * hm_results[img_path][0]["hm"]).astype(np.uint8), cv2.COLOR_GRAY2RGB)
+                vis_hm_pred = cv2.resize(vis_hm_pred, (1280, 720))
+                vis_hm_pred = draw_frame(
+                    vis_hm_pred,
+                    center=Center(is_visible=visi_pred, x=x_pred, y=y_pred),
+                    color=color_pred,
+                    radius=3,
+                    angle=angle_pred,
+                    l=length_pred,
+                )
+            else:
+                vis_pred = draw_frame(vis_pred, center=Center(is_visible=visi_pred, x=x_pred, y=y_pred), color=color_pred, radius=3)
+                vis_hm_pred = cv2.cvtColor((255 * hm_results[img_path][0]["hm"]).astype(np.uint8), cv2.COLOR_GRAY2RGB)
+                vis_hm_pred = draw_frame(vis_hm_pred, center=Center(is_visible=visi_pred, x=x_pred, y=y_pred), color=color_pred, radius=3)
 
-                x_pred = result_dict[img_path2]["x"]
-                y_pred = result_dict[img_path2]["y"]
-                visi_pred = result_dict[img_path2]["visi"]
-                score_pred = result_dict[img_path2]["score"]
-                if cfg["model"]["name"] == "blurball":
-                    angle_pred = result_dict[img_path2]["angle"]
-                    length_pred = result_dict[img_path2]["length"]
-
-                color_pred = (
-                    int(cm_pred(cnt2)[2] * 255),
-                    int(cm_pred(cnt2)[1] * 255),
-                    int(cm_pred(cnt2)[0] * 255),
+            if current_speed_kmh is not None and current_direction_rad is not None:
+                vis_pred = draw_speed_direction_hud(
+                    vis_pred,
+                    current_speed_kmh,
+                    current_direction_rad,
+                    position=hud_position,
                 )
 
-                color_pred = (255, 0, 0)
-                if cfg["model"]["name"] == "blurball":
-                    vis_pred = draw_frame(
-                        vis_pred,
-                        center=Center(is_visible=visi_pred, x=x_pred, y=y_pred),
-                        color=color_pred,
-                        radius=3,
-                        angle=angle_pred,
-                        l=length_pred,
-                    )
-                    vis_hm_pred = cv2.cvtColor(
-                        (255 * hm_results[img_path][0]["hm"]).astype(np.uint8),
-                        cv2.COLOR_GRAY2RGB,
-                    )
-                    vis_hm_pred = cv2.resize(vis_hm_pred, (1280, 720))
-                    vis_hm_pred = draw_frame(
-                        vis_hm_pred,
-                        center=Center(is_visible=visi_pred, x=x_pred, y=y_pred),
-                        color=color_pred,
-                        radius=3,
-                        angle=angle_pred,
-                        l=length_pred,
-                    )
-                else:
-                    vis_pred = draw_frame(
-                        vis_pred,
-                        center=Center(is_visible=visi_pred, x=x_pred, y=y_pred),
-                        color=color_pred,
-                        radius=3,
-                    )
-                    vis_hm_pred = cv2.cvtColor(
-                        (255 * hm_results[img_path][0]["hm"]).astype(np.uint8),
-                        cv2.COLOR_GRAY2RGB,
-                    )
-                    vis_hm_pred = draw_frame(
-                        vis_hm_pred,
-                        center=Center(is_visible=visi_pred, x=x_pred, y=y_pred),
-                        color=color_pred,
-                        radius=3,
-                    )
-
-            # vis = np.hstack((vis_gt, vis_pred))
-            vis = vis_pred
-            cv2.imwrite(vis_frame_path, vis)
+            cv2.imwrite(vis_frame_path, vis_pred)
             cv2.imwrite(hm_path, vis_hm_pred)
-
-        # if vis_traj_path is not None:
-        #     color_pred = (
-        #         int(cm_pred(cnt)[2] * 255),
-        #         int(cm_pred(cnt)[1] * 255),
-        #         int(cm_pred(cnt)[0] * 255),
-        #     )
-        #     vis = visualizer.draw_frame(
-        #         vis,
-        #         center_gt=center_gt,
-        #         color_gt=color_gt,
-        #     )
 
     if vis_frame_dir is not None:
         video_path = "{}.mp4".format(vis_frame_dir)
-        gen_video(video_path, vis_frame_dir, fps=25.0)
+        gen_video(video_path, vis_frame_dir, fps=fps)
         print("Saving video at " + video_path)
 
-    # Save the evaluation results
     if cfg["model"]["name"] == "blurball":
-        df = pd.DataFrame(
-            {
-                "Frame": x_fin,
-                "X": x_fin,
-                "Y": y_fin,
-                "Visibility": vis_fin,
-                "L": l_fin,
-                "Theta": theta_fin,
-            }
-        )
+        df = pd.DataFrame({"Frame": x_fin, "X": x_fin, "Y": y_fin, "Visibility": vis_fin, "L": l_fin, "Theta": theta_fin})
     else:
-        df = pd.DataFrame(
-            {"Frame": x_fin, "X": x_fin, "Y": y_fin, "Visibility": vis_fin}
-        )
+        df = pd.DataFrame({"Frame": x_fin, "X": x_fin, "Y": y_fin, "Visibility": vis_fin})
     df["Frame"] = df.index
     df.to_csv(osp.join(frame_dir, "traj.csv"), index=False)
     print("Saving csv at " + osp.join(frame_dir, "traj.csv"))
-
     return {"t_elapsed": t_elapsed, "num_frames": num_frames}
 
 
 class NewVideosInferenceRunner(BaseRunner):
-    def __init__(
-        self,
-        cfg: DictConfig,
-    ):
+    def __init__(self, cfg: DictConfig):
         super().__init__(cfg)
-        # print(cfg["input_vid"])
-
         self._vis_result = cfg["runner"]["vis_result"]
         self._vis_hm = cfg["runner"]["vis_hm"]
         self._vis_traj = cfg["runner"]["vis_traj"]
@@ -303,11 +229,8 @@ class NewVideosInferenceRunner(BaseRunner):
     def _run_model(self, model=None):
         detector = build_detector(self._cfg, model=model)
         tracker = build_tracker(self._cfg)
-
-        # Generate frames directory for processing
         frame_dir = process_video(self._input_vid_path)
         print("Finished preprocess_video")
-
         t_elapsed_all = 0.0
         num_frames_all = 0
 
@@ -318,10 +241,6 @@ class NewVideosInferenceRunner(BaseRunner):
         if self._vis_hm:
             vis_hm_dir = osp.join(self._input_vid_path.parent, "hm")
             mkdir_if_missing(vis_hm_dir)
-        # if self._vis_traj:
-        #     vis_traj_dir = osp.join(self._output_dir, "vis_traj")
-        #     mkdir_if_missing(vis_traj_dir)
-        #     vis_traj_path = osp.join(vis_traj_dir, "{}_{}.png".format(match, clip_name))
 
         tmp = inference_video(
             detector,
@@ -332,8 +251,6 @@ class NewVideosInferenceRunner(BaseRunner):
             vis_frame_dir=vis_frame_dir,
             vis_hm_dir=vis_hm_dir,
         )
-
         t_elapsed_all += tmp["t_elapsed"]
         num_frames_all += tmp["num_frames"]
-
         return
