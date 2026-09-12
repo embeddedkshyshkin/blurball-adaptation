@@ -137,8 +137,6 @@ def inference_video(
     if existing_traj_path is not None:
         result_dict = load_trajectory(existing_traj_path, imgs_paths, cfg["model"]["name"])
     else:
-        frames_in = detector.frames_in
-        frames_out = detector.frames_out
         c = np.array([w / 2.0, h / 2.0], dtype=np.float32)
         s = max(h, w) * 1.0
         trans = np.stack(
@@ -186,7 +184,6 @@ def inference_video(
         print("Finished tracking")
 
     t_elapsed = time.time() - t_start
-    cm_pred = plt.get_cmap("Reds", len(result_dict))
 
     x_fin, y_fin, vis_fin = [], [], []
     if cfg["model"]["name"] == "blurball":
@@ -331,14 +328,15 @@ class NewVideosInferenceRunner(BaseRunner):
         return self._run_model(model=model)
 
     def _run_model(self, model=None):
-        # Prefer CUDA whenever an NVIDIA GPU is available (e.g. RTX 5000 Ada),
-        # while keeping the same command usable on CPU-only machines.
+        # BlurBall requires CUDA. Select it automatically on machines with an NVIDIA GPU.
+        # The detector itself validates CUDA availability and uses runner.device/gpus.
         if torch.cuda.is_available():
-            self._cfg.device = "cuda"
+            self._cfg["runner"]["device"] = "cuda"
+            self._cfg["runner"]["gpus"] = [0]
             print(f"Using CUDA GPU: {torch.cuda.get_device_name(0)}")
         else:
-            self._cfg.device = "cpu"
-            print("CUDA is not available; using CPU")
+            self._cfg["runner"]["device"] = "cuda"
+            print("CUDA is not available; BlurBall requires an NVIDIA CUDA GPU")
 
         frame_dir = self._input_vid_path.parent / ("frames_" + self._input_vid_path.stem)
         frame_pngs = list(frame_dir.glob("*.png")) if frame_dir.is_dir() else []
