@@ -73,6 +73,37 @@ def project_to_table(point_xy, homography):
     return float(projected[0]), float(projected[1])
 
 
+def load_trajectory(traj_path, imgs_paths, model_name):
+    """Load an existing BlurBall trajectory without rerunning detection/tracking."""
+    df = pd.read_csv(traj_path)
+    if not {"X", "Y", "Visibility"}.issubset(df.columns):
+        raise ValueError(f"Invalid trajectory file: {traj_path}")
+
+    if len(df) > len(imgs_paths):
+        raise ValueError(
+            f"Trajectory has {len(df)} rows but only {len(imgs_paths)} extracted frames are available"
+        )
+
+    result_dict = {}
+    for index, row in df.iterrows():
+        img_path = str(imgs_paths[index])
+        result = {
+            "x": float(row["X"]),
+            "y": float(row["Y"]),
+            "visi": int(row["Visibility"]),
+            "score": 0.0,
+        }
+        if model_name == "blurball":
+            if not {"L", "Theta"}.issubset(df.columns):
+                raise ValueError(f"BlurBall trajectory is missing L/Theta columns: {traj_path}")
+            result["angle"] = float(row["Theta"])
+            result["length"] = float(row["L"])
+        result_dict[img_path] = result
+
+    print(f"Reusing trajectory: {traj_path} ({len(result_dict)} frames)")
+    return result_dict
+
+
 @torch.no_grad()
 def inference_video(
     detector,
@@ -84,17 +115,16 @@ def inference_video(
     vis_hm_dir=None,
     vis_traj_path=None,
     dist_thresh=10.0,
+    existing_traj_path=None,
 ):
-    frames_in = detector.frames_in
-    frames_out = detector.frames_out
     t_start = time.time()
-
-    det_results = []
-    hm_results = []
     num_frames = 0
     print("Starting********")
 
     imgs_paths = sorted(Path(frame_dir).glob("*.png"))
+    if not imgs_paths:
+        raise ValueError(f"No extracted PNG frames found in {frame_dir}")
+
     cap = cv2.VideoCapture(str(input_video_path))
     fps = cap.get(cv2.CAP_PROP_FPS)
     w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
@@ -103,52 +133,57 @@ def inference_video(
     if not fps or fps <= 0:
         raise ValueError("Could not determine source video FPS")
 
-    c = np.array([w / 2.0, h / 2.0], dtype=np.float32)
-    s = max(h, w) * 1.0
-    trans = np.stack(
-        [get_affine_transform(c, s, 0, [cfg["model"]["inp_width"], cfg["model"]["inp_height"]], inv=1) for _ in range(3)],
-        axis=0,
-    )
-    trans = torch.tensor(trans)[None, :]
-    preprocess_frame = T.Compose(
-        [
-            T.ToPILImage(),
-            T.Resize((cfg["model"]["inp_height"], cfg["model"]["inp_width"])),
-            T.ToTensor(),
-            T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-        ]
-    )
-    step = cfg["detector"]["step"]
-    det_results = defaultdict(list)
     hm_results = defaultdict(list)
-    img_paths_buffer = []
-    frames_buffer = []
-    for img_path in imgs_paths:
-        frame = cv2.imread(str(img_path))
-        frames_buffer.append(frame)
-        img_paths_buffer.append(str(img_path))
-        if len(frames_buffer) == cfg["model"]["frames_in"]:
-            frames_processed = [preprocess_frame(f) for f in frames_buffer]
-            input_tensor = torch.cat(frames_processed, dim=0).unsqueeze(0)
-            batch_results, hms_vis = detector.run_tensor(input_tensor, trans)
-            for ie in batch_results[0].keys():
-                path = img_paths_buffer[ie]
-                preds = batch_results[0][ie]
-                det_results[path].extend(preds)
-                hm_results[path].extend(hms_vis[0][ie])
-            if step == 1:
-                frames_buffer.pop(0)
-                img_paths_buffer.pop(0)
-            elif step == 3:
-                img_paths_buffer = []
-                frames_buffer = []
+    if existing_traj_path is not None:
+        result_dict = load_trajectory(existing_traj_path, imgs_paths, cfg["model"]["name"])
+    else:
+        frames_in = detector.frames_in
+        frames_out = detector.frames_out
+        c = np.array([w / 2.0, h / 2.0], dtype=np.float32)
+        s = max(h, w) * 1.0
+        trans = np.stack(
+            [get_affine_transform(c, s, 0, [cfg["model"]["inp_width"], cfg["model"]["inp_height"]], inv=1) for _ in range(3)],
+            axis=0,
+        )
+        trans = torch.tensor(trans)[None, :]
+        preprocess_frame = T.Compose(
+            [
+                T.ToPILImage(),
+                T.Resize((cfg["model"]["inp_height"], cfg["model"]["inp_width"])),
+                T.ToTensor(),
+                T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+            ]
+        )
+        step = cfg["detector"]["step"]
+        det_results = defaultdict(list)
+        img_paths_buffer = []
+        frames_buffer = []
+        for img_path in imgs_paths:
+            frame = cv2.imread(str(img_path))
+            frames_buffer.append(frame)
+            img_paths_buffer.append(str(img_path))
+            if len(frames_buffer) == cfg["model"]["frames_in"]:
+                frames_processed = [preprocess_frame(f) for f in frames_buffer]
+                input_tensor = torch.cat(frames_processed, dim=0).unsqueeze(0)
+                batch_results, hms_vis = detector.run_tensor(input_tensor, trans)
+                for ie in batch_results[0].keys():
+                    path = img_paths_buffer[ie]
+                    preds = batch_results[0][ie]
+                    det_results[path].extend(preds)
+                    hm_results[path].extend(hms_vis[0][ie])
+                if step == 1:
+                    frames_buffer.pop(0)
+                    img_paths_buffer.pop(0)
+                elif step == 3:
+                    img_paths_buffer = []
+                    frames_buffer = []
 
-    tracker.refresh()
-    result_dict = {}
-    print("Running tracker")
-    for img_path, preds in det_results.items():
-        result_dict[img_path] = tracker.update(preds)
-    print("Finished tracking")
+        tracker.refresh()
+        result_dict = {}
+        print("Running tracker")
+        for img_path, preds in det_results.items():
+            result_dict[img_path] = tracker.update(preds)
+        print("Finished tracking")
 
     t_elapsed = time.time() - t_start
     cm_pred = plt.get_cmap("Reds", len(result_dict))
@@ -227,7 +262,6 @@ def inference_video(
 
         if vis_frame_dir is not None:
             vis_frame_path = osp.join(vis_frame_dir, osp.basename(img_path))
-            hm_path = osp.join(vis_hm_dir, osp.basename(img_path))
             vis_pred = cv2.imread(img_path)
 
             color_pred = (255, 0, 0)
@@ -240,20 +274,8 @@ def inference_video(
                     angle=angle_pred,
                     l=length_pred,
                 )
-                vis_hm_pred = cv2.cvtColor((255 * hm_results[img_path][0]["hm"]).astype(np.uint8), cv2.COLOR_GRAY2RGB)
-                vis_hm_pred = cv2.resize(vis_hm_pred, (1280, 720))
-                vis_hm_pred = draw_frame(
-                    vis_hm_pred,
-                    center=Center(is_visible=visi_pred, x=x_pred, y=y_pred),
-                    color=color_pred,
-                    radius=3,
-                    angle=angle_pred,
-                    l=length_pred,
-                )
             else:
                 vis_pred = draw_frame(vis_pred, center=Center(is_visible=visi_pred, x=x_pred, y=y_pred), color=color_pred, radius=3)
-                vis_hm_pred = cv2.cvtColor((255 * hm_results[img_path][0]["hm"]).astype(np.uint8), cv2.COLOR_GRAY2RGB)
-                vis_hm_pred = draw_frame(vis_hm_pred, center=Center(is_visible=visi_pred, x=x_pred, y=y_pred), color=color_pred, radius=3)
 
             if current_speed_kmh is not None and current_direction_rad is not None:
                 vis_pred = draw_speed_direction_hud(
@@ -264,20 +286,36 @@ def inference_video(
                 )
 
             cv2.imwrite(vis_frame_path, vis_pred)
-            cv2.imwrite(hm_path, vis_hm_pred)
+
+            if vis_hm_dir is not None:
+                hm_path = osp.join(vis_hm_dir, osp.basename(img_path))
+                if img_path in hm_results and hm_results[img_path]:
+                    vis_hm_pred = cv2.cvtColor((255 * hm_results[img_path][0]["hm"]).astype(np.uint8), cv2.COLOR_GRAY2RGB)
+                    vis_hm_pred = cv2.resize(vis_hm_pred, (1280, 720))
+                    vis_hm_pred = draw_frame(
+                        vis_hm_pred,
+                        center=Center(is_visible=visi_pred, x=x_pred, y=y_pred),
+                        color=color_pred,
+                        radius=3,
+                        angle=angle_pred if cfg["model"]["name"] == "blurball" else None,
+                        l=length_pred if cfg["model"]["name"] == "blurball" else None,
+                    )
+                    cv2.imwrite(hm_path, vis_hm_pred)
 
     if vis_frame_dir is not None:
         video_path = "{}.mp4".format(vis_frame_dir)
         gen_video(video_path, vis_frame_dir, fps=fps)
         print("Saving video at " + video_path)
 
-    if cfg["model"]["name"] == "blurball":
-        df = pd.DataFrame({"Frame": x_fin, "X": x_fin, "Y": y_fin, "Visibility": vis_fin, "L": l_fin, "Theta": theta_fin})
-    else:
-        df = pd.DataFrame({"Frame": x_fin, "X": x_fin, "Y": y_fin, "Visibility": vis_fin})
-    df["Frame"] = df.index
-    df.to_csv(osp.join(frame_dir, "traj.csv"), index=False)
-    print("Saving csv at " + osp.join(frame_dir, "traj.csv"))
+    if existing_traj_path is None:
+        if cfg["model"]["name"] == "blurball":
+            df = pd.DataFrame({"Frame": x_fin, "X": x_fin, "Y": y_fin, "Visibility": vis_fin, "L": l_fin, "Theta": theta_fin})
+        else:
+            df = pd.DataFrame({"Frame": x_fin, "X": x_fin, "Y": y_fin, "Visibility": vis_fin})
+        df["Frame"] = df.index
+        df.to_csv(osp.join(frame_dir, "traj.csv"), index=False)
+        print("Saving csv at " + osp.join(frame_dir, "traj.csv"))
+
     return {"t_elapsed": t_elapsed, "num_frames": num_frames}
 
 
@@ -293,10 +331,33 @@ class NewVideosInferenceRunner(BaseRunner):
         return self._run_model(model=model)
 
     def _run_model(self, model=None):
-        detector = build_detector(self._cfg, model=model)
-        tracker = build_tracker(self._cfg)
-        frame_dir = process_video(self._input_vid_path)
-        print("Finished preprocess_video")
+        # Prefer CUDA whenever an NVIDIA GPU is available (e.g. RTX 5000 Ada),
+        # while keeping the same command usable on CPU-only machines.
+        if torch.cuda.is_available():
+            self._cfg.device = "cuda"
+            print(f"Using CUDA GPU: {torch.cuda.get_device_name(0)}")
+        else:
+            self._cfg.device = "cpu"
+            print("CUDA is not available; using CPU")
+
+        frame_dir = self._input_vid_path.parent / ("frames_" + self._input_vid_path.stem)
+        frame_pngs = list(frame_dir.glob("*.png")) if frame_dir.is_dir() else []
+        if frame_pngs:
+            print(f"Reusing extracted frames: {frame_dir} ({len(frame_pngs)} PNGs)")
+        else:
+            frame_dir = Path(process_video(self._input_vid_path))
+            print("Finished preprocess_video")
+
+        traj_path = frame_dir / "traj.csv"
+        reuse_traj = traj_path.is_file()
+        detector = None
+        tracker = None
+        if reuse_traj:
+            print(f"Reusing existing trajectory: {traj_path}")
+        else:
+            detector = build_detector(self._cfg, model=model)
+            tracker = build_tracker(self._cfg)
+
         t_elapsed_all = 0.0
         num_frames_all = 0
 
@@ -316,6 +377,7 @@ class NewVideosInferenceRunner(BaseRunner):
             self._cfg,
             vis_frame_dir=vis_frame_dir,
             vis_hm_dir=vis_hm_dir,
+            existing_traj_path=traj_path if reuse_traj else None,
         )
         t_elapsed_all += tmp["t_elapsed"]
         num_frames_all += tmp["num_frames"]
