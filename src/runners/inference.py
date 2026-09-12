@@ -1,5 +1,6 @@
 import os
 import os.path as osp
+import json
 import matplotlib.pyplot as plt
 import shutil
 import torchvision.transforms as T
@@ -25,6 +26,52 @@ from utils.image import get_affine_transform, affine_transform
 from utils.preprocess import process_video
 
 from .base import BaseRunner
+
+
+def load_speed_calibration(calibration_file):
+    """Load PongEye table calibration and build image -> table homography."""
+    if not calibration_file:
+        return None
+
+    path = Path(calibration_file)
+    if not path.is_absolute():
+        path = Path(HydraConfig.get().runtime.cwd) / path
+
+    with path.open("r", encoding="utf-8") as f:
+        calibration = json.load(f)
+
+    data = calibration["calibration"]
+    corners = data["corners"]
+    length_m = float(data["tableDimensions"]["lengthMeters"])
+    width_m = float(data["tableDimensions"]["widthMeters"])
+
+    image_points = np.array(
+        [
+            [corners["topLeft"]["x"], corners["topLeft"]["y"]],
+            [corners["topRight"]["x"], corners["topRight"]["y"]],
+            [corners["bottomRight"]["x"], corners["bottomRight"]["y"]],
+            [corners["bottomLeft"]["x"], corners["bottomLeft"]["y"]],
+        ],
+        dtype=np.float32,
+    )
+    table_points = np.array(
+        [
+            [0.0, 0.0],
+            [length_m, 0.0],
+            [length_m, width_m],
+            [0.0, width_m],
+        ],
+        dtype=np.float32,
+    )
+
+    homography = cv2.getPerspectiveTransform(image_points, table_points)
+    return homography
+
+
+def project_to_table(point_xy, homography):
+    point = np.array([[point_xy]], dtype=np.float32)
+    projected = cv2.perspectiveTransform(point, homography)[0, 0]
+    return float(projected[0]), float(projected[1])
 
 
 @torch.no_grad()
@@ -113,10 +160,16 @@ def inference_video(
 
     vis_cfg = cfg.get("runner", {}).get("visualization", {})
     show_speed_direction = bool(vis_cfg.get("show_speed_direction", False))
-    meters_per_pixel = vis_cfg.get("speed_meters_per_pixel", None)
+    calibration_file = vis_cfg.get("calibration_file", None)
     speed_window = max(1, int(vis_cfg.get("speed_window_frames", 4)))
     smoothing_alpha = float(vis_cfg.get("speed_smoothing_alpha", 0.35))
     hud_position = vis_cfg.get("hud_position", "top_center")
+
+    speed_homography = None
+    if show_speed_direction and calibration_file:
+        speed_homography = load_speed_calibration(calibration_file)
+        print("Loaded PongEye calibration from " + str(calibration_file))
+
     recent_positions = []
     smoothed_speed_kmh = None
 
@@ -139,25 +192,40 @@ def inference_video(
         current_speed_kmh = None
         current_direction_rad = None
         if show_speed_direction and visi_pred:
-            recent_positions.append((cnt, float(x_pred), float(y_pred)))
+            current_position = (float(x_pred), float(y_pred))
+            if speed_homography is not None:
+                table_position = project_to_table(current_position, speed_homography)
+            else:
+                table_position = current_position
+
+            recent_positions.append((cnt, current_position, table_position))
             if len(recent_positions) > speed_window + 1:
                 recent_positions.pop(0)
+
             if len(recent_positions) >= 2:
-                first_frame, first_x, first_y = recent_positions[0]
+                first_frame, first_image_pos, first_table_pos = recent_positions[0]
                 dt = (cnt - first_frame) / fps
-                dx = float(x_pred) - first_x
-                dy = float(y_pred) - first_y
-                distance_px = float(np.hypot(dx, dy))
-                if dt > 0 and distance_px > 0:
-                    current_direction_rad = float(np.arctan2(dy, dx))
-                    speed_px_s = distance_px / dt
-                    if meters_per_pixel is not None and float(meters_per_pixel) > 0:
-                        raw_speed_kmh = speed_px_s * float(meters_per_pixel) * 3.6
+                if dt > 0:
+                    dx_table = table_position[0] - first_table_pos[0]
+                    dy_table = table_position[1] - first_table_pos[1]
+                    distance_m = float(np.hypot(dx_table, dy_table))
+                    if distance_m > 0:
+                        raw_speed_kmh = distance_m / dt * 3.6
                         if smoothed_speed_kmh is None:
                             smoothed_speed_kmh = raw_speed_kmh
                         else:
-                            smoothed_speed_kmh = smoothing_alpha * raw_speed_kmh + (1.0 - smoothing_alpha) * smoothed_speed_kmh
+                            smoothed_speed_kmh = (
+                                smoothing_alpha * raw_speed_kmh
+                                + (1.0 - smoothing_alpha) * smoothed_speed_kmh
+                            )
                         current_speed_kmh = smoothed_speed_kmh
+
+                    # The arrow is rendered in image coordinates so it points
+                    # along the visible ball trajectory in the video.
+                    dx_image = current_position[0] - first_image_pos[0]
+                    dy_image = current_position[1] - first_image_pos[1]
+                    if np.hypot(dx_image, dy_image) > 0:
+                        current_direction_rad = float(np.arctan2(dy_image, dx_image))
 
         if vis_frame_dir is not None:
             vis_frame_path = osp.join(vis_frame_dir, osp.basename(img_path))
