@@ -1,6 +1,8 @@
 name: inference
 device: cuda
 gpus: [0]
+mode: standard
+keep_extracted_frames: true
 vis_result: True
 vis_hm: True
 vis_traj: False
@@ -9,10 +11,12 @@ eval:
   score_threshold: 0.5
 visualization:
   show_speed_direction: True
-  speed_window_frames: 4
-  direction_window_frames: 1
-  speed_smoothing_alpha: 0.35
-  direction_change_threshold_deg: 110
-  direction_min_distance_m: 0.01
-  direction_stabilization_frames: 1
+  speed_window_frames: 7
+  direction_window_frames: 5
+  speed_smoothing_alpha: 0.25
+  direction_change_threshold_deg: 115
+  direction_min_distance_m: 0.015
+  direction_min_speed_kmh: 2.0
+  reversal_confirm_frames: 3
+  direction_smoothing_alpha: 0.35
   hud_position: top_center
