@@ -24,6 +24,7 @@ from trackers import build_tracker
 from utils import mkdir_if_missing, draw_frame, draw_speed_direction_hud, gen_video, Center, Evaluator
 from utils.image import get_affine_transform, affine_transform
 from utils.preprocess import process_video
+from utils.motion import MotionEstimator
 
 from .base import BaseRunner
 
@@ -192,27 +193,36 @@ def inference_video(
     vis_cfg = cfg.get("runner", {}).get("visualization", {})
     show_speed_direction = bool(vis_cfg.get("show_speed_direction", False))
     calibration_file = cfg.get("calibration_file", None)
-    speed_window = max(1, int(vis_cfg.get("speed_window_frames", 4)))
-    direction_window = max(1, int(vis_cfg.get("direction_window_frames", 1)))
-    smoothing_alpha = float(vis_cfg.get("speed_smoothing_alpha", 0.35))
-    direction_change_threshold_deg = float(vis_cfg.get("direction_change_threshold_deg", 110.0))
-    direction_min_distance_m = float(vis_cfg.get("direction_min_distance_m", 0.01))
-    direction_stabilization_frames = max(0, int(vis_cfg.get("direction_stabilization_frames", 1)))
+    speed_window = max(3, int(vis_cfg.get("speed_window_frames", 7)))
+    direction_window = max(3, int(vis_cfg.get("direction_window_frames", 5)))
+    smoothing_alpha = float(vis_cfg.get("speed_smoothing_alpha", 0.25))
+    direction_change_threshold_deg = float(vis_cfg.get("direction_change_threshold_deg", 115.0))
+    direction_min_distance_m = float(vis_cfg.get("direction_min_distance_m", 0.015))
+    min_speed_kmh = float(vis_cfg.get("direction_min_speed_kmh", 2.0))
+    reversal_confirm_frames = max(1, int(vis_cfg.get("reversal_confirm_frames", 3)))
+    direction_smoothing_alpha = float(vis_cfg.get("direction_smoothing_alpha", 0.35))
     hud_position = vis_cfg.get("hud_position", "top_center")
 
     speed_homography = None
+    motion_estimator = None
     if show_speed_direction:
         if not calibration_file:
-            raise ValueError(
-                "Speed/direction visualization requires +calibration_file=<PongEye calibration JSON>"
+            print("Calibration not provided; speed/direction calculation is disabled")
+            show_speed_direction = False
+        else:
+            speed_homography = load_speed_calibration(calibration_file)
+            print("Loaded PongEye calibration from " + str(calibration_file))
+            motion_estimator = MotionEstimator(
+                fps=fps,
+                speed_window_frames=speed_window,
+                direction_window_frames=direction_window,
+                speed_smoothing_alpha=smoothing_alpha,
+                direction_change_threshold_deg=direction_change_threshold_deg,
+                min_displacement_m=direction_min_distance_m,
+                min_speed_kmh=min_speed_kmh,
+                reversal_confirm_frames=reversal_confirm_frames,
+                direction_smoothing_alpha=direction_smoothing_alpha,
             )
-        speed_homography = load_speed_calibration(calibration_file)
-        print("Loaded PongEye calibration from " + str(calibration_file))
-
-    recent_positions = []
-    smoothed_speed_kmh = None
-    stable_direction_rad = None
-    stabilization_remaining = 0
 
     for cnt, img_path in enumerate(result_dict.keys()):
         x_pred = result_dict[img_path]["x"]
@@ -232,76 +242,11 @@ def inference_video(
 
         current_speed_kmh = 0.0
         current_direction_rad = None
-        if show_speed_direction and visi_pred:
-            current_position = (float(x_pred), float(y_pred))
-            table_position = project_to_table(current_position, speed_homography)
-
-            recent_positions.append((cnt, current_position, table_position))
-            max_history = max(speed_window + 1, direction_window + 2)
-            if len(recent_positions) > max_history:
-                recent_positions.pop(0)
-
-            if stabilization_remaining > 0:
-                stabilization_remaining -= 1
-
-            # Speed uses a short multi-frame displacement for noise resistance.
-            if len(recent_positions) >= 2:
-                first_frame, first_image_pos, first_table_pos = recent_positions[0]
-                dt = (cnt - first_frame) / fps
-                if dt > 0:
-                    dx_table = table_position[0] - first_table_pos[0]
-                    dy_table = table_position[1] - first_table_pos[1]
-                    distance_m = float(np.hypot(dx_table, dy_table))
-                    if distance_m > 0:
-                        raw_speed_kmh = distance_m / dt * 3.6
-                        if smoothed_speed_kmh is None:
-                            smoothed_speed_kmh = raw_speed_kmh
-                        else:
-                            smoothed_speed_kmh = (
-                                smoothing_alpha * raw_speed_kmh
-                                + (1.0 - smoothing_alpha) * smoothed_speed_kmh
-                            )
-                        current_speed_kmh = smoothed_speed_kmh
-
-            # Direction is deliberately computed from the latest segment rather
-            # than the speed window. This prevents a pre-bounce direction from
-            # leaking into the first post-bounce frames.
-            if len(recent_positions) >= direction_window + 1:
-                prev_frame, prev_image_pos, prev_table_pos = recent_positions[-direction_window - 1]
-                frame_delta = cnt - prev_frame
-                if frame_delta > 0:
-                    dx_table = table_position[0] - prev_table_pos[0]
-                    dy_table = table_position[1] - prev_table_pos[1]
-                    segment_distance_m = float(np.hypot(dx_table, dy_table))
-                    if segment_distance_m >= direction_min_distance_m:
-                        candidate_direction_rad = float(np.arctan2(dy_table, dx_table))
-
-                        if stable_direction_rad is not None:
-                            direction_delta = abs(
-                                np.arctan2(
-                                    np.sin(candidate_direction_rad - stable_direction_rad),
-                                    np.cos(candidate_direction_rad - stable_direction_rad),
-                                )
-                            )
-                            direction_delta_deg = float(np.degrees(direction_delta))
-                        else:
-                            direction_delta_deg = 0.0
-
-                        if (
-                            stable_direction_rad is not None
-                            and direction_delta_deg >= direction_change_threshold_deg
-                        ):
-                            # A sharp reversal is treated as a bounce/discontinuity.
-                            # Do not show the old arrow or old smoothed speed here.
-                            recent_positions = [(cnt, current_position, table_position)]
-                            smoothed_speed_kmh = None
-                            stable_direction_rad = None
-                            stabilization_remaining = direction_stabilization_frames
-                            current_speed_kmh = 0.0
-                            current_direction_rad = None
-                        elif stabilization_remaining == 0:
-                            stable_direction_rad = candidate_direction_rad
-                            current_direction_rad = candidate_direction_rad
+        if motion_estimator is not None and visi_pred:
+            table_position = project_to_table((float(x_pred), float(y_pred)), speed_homography)
+            current_speed_kmh, current_direction_rad = motion_estimator.update(cnt, table_position)
+        elif motion_estimator is not None:
+            motion_estimator.reset()
 
         if not visi_pred:
             current_speed_kmh = 0.0
@@ -322,7 +267,12 @@ def inference_video(
                     l=length_pred,
                 )
             else:
-                vis_pred = draw_frame(vis_pred, center=Center(is_visible=visi_pred, x=x_pred, y=y_pred), color=color_pred, radius=3)
+                vis_pred = draw_frame(
+                    vis_pred,
+                    center=Center(is_visible=visi_pred, x=x_pred, y=y_pred),
+                    color=color_pred,
+                    radius=3,
+                )
 
             if show_speed_direction:
                 vis_pred = draw_speed_direction_hud(
@@ -337,7 +287,10 @@ def inference_video(
             if vis_hm_dir is not None:
                 hm_path = osp.join(vis_hm_dir, osp.basename(img_path))
                 if img_path in hm_results and hm_results[img_path]:
-                    vis_hm_pred = cv2.cvtColor((255 * hm_results[img_path][0]["hm"]).astype(np.uint8), cv2.COLOR_GRAY2RGB)
+                    vis_hm_pred = cv2.cvtColor(
+                        (255 * hm_results[img_path][0]["hm"]).astype(np.uint8),
+                        cv2.COLOR_GRAY2RGB,
+                    )
                     vis_hm_pred = cv2.resize(vis_hm_pred, (1280, 720))
                     vis_hm_pred = draw_frame(
                         vis_hm_pred,
@@ -363,7 +316,16 @@ def inference_video(
 
     if existing_traj_path is None:
         if cfg["model"]["name"] == "blurball":
-            df = pd.DataFrame({"Frame": x_fin, "X": x_fin, "Y": y_fin, "Visibility": vis_fin, "L": l_fin, "Theta": theta_fin})
+            df = pd.DataFrame(
+                {
+                    "Frame": x_fin,
+                    "X": x_fin,
+                    "Y": y_fin,
+                    "Visibility": vis_fin,
+                    "L": l_fin,
+                    "Theta": theta_fin,
+                }
+            )
         else:
             df = pd.DataFrame({"Frame": x_fin, "X": x_fin, "Y": y_fin, "Visibility": vis_fin})
         df["Frame"] = df.index
@@ -376,17 +338,28 @@ def inference_video(
 class NewVideosInferenceRunner(BaseRunner):
     def __init__(self, cfg: DictConfig):
         super().__init__(cfg)
-        self._vis_result = cfg["runner"]["vis_result"]
-        self._vis_hm = cfg["runner"]["vis_hm"]
-        self._vis_traj = cfg["runner"]["vis_traj"]
+        runner_cfg = cfg["runner"]
+        self._mode = str(runner_cfg.get("mode", "standard"))
+        self._keep_extracted_frames = bool(runner_cfg.get("keep_extracted_frames", True))
+        self._vis_result = bool(runner_cfg.get("vis_result", True))
+        self._vis_hm = bool(runner_cfg.get("vis_hm", True))
+        self._vis_traj = bool(runner_cfg.get("vis_traj", False))
         self._input_vid_path = Path(cfg["input_vid"])
+
+        if self._mode not in {"standard", "trajectory_only"}:
+            raise ValueError(
+                f"Unsupported runner.mode={self._mode!r}; expected 'standard' or 'trajectory_only'"
+            )
+        if self._mode == "trajectory_only":
+            self._vis_result = False
+            self._vis_hm = False
+            self._vis_traj = False
 
     def run(self, model=None, model_dir=None):
         return self._run_model(model=model)
 
     def _run_model(self, model=None):
         # BlurBall requires CUDA. Select it automatically on machines with an NVIDIA GPU.
-        # The detector itself validates CUDA availability and uses runner.device/gpus.
         if torch.cuda.is_available():
             self._cfg["runner"]["device"] = "cuda"
             self._cfg["runner"]["gpus"] = [0]
@@ -397,10 +370,12 @@ class NewVideosInferenceRunner(BaseRunner):
 
         frame_dir = self._input_vid_path.parent / ("frames_" + self._input_vid_path.stem)
         frame_pngs = list(frame_dir.glob("*.png")) if frame_dir.is_dir() else []
+        extracted_here = False
         if frame_pngs:
             print(f"Reusing extracted frames: {frame_dir} ({len(frame_pngs)} PNGs)")
         else:
             frame_dir = Path(process_video(self._input_vid_path))
+            extracted_here = True
             print("Finished preprocess_video")
 
         traj_path = frame_dir / "traj.csv"
@@ -436,4 +411,10 @@ class NewVideosInferenceRunner(BaseRunner):
         )
         t_elapsed_all += tmp["t_elapsed"]
         num_frames_all += tmp["num_frames"]
+
+        if self._mode == "trajectory_only" and extracted_here and not self._keep_extracted_frames:
+            if frame_dir.exists():
+                print(f"Removing temporary extracted frames: {frame_dir}")
+                shutil.rmtree(frame_dir)
+
         return
