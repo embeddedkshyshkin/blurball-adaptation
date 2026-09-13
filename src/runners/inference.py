@@ -413,8 +413,13 @@ class NewVideosInferenceRunner(BaseRunner):
         num_frames_all += tmp["num_frames"]
 
         if self._mode == "trajectory_only" and extracted_here and not self._keep_extracted_frames:
-            if frame_dir.exists():
-                print(f"Removing temporary extracted frames: {frame_dir}")
-                shutil.rmtree(frame_dir)
+            print(f"Removing temporary extracted PNG frames: {frame_dir}")
+            for png_path in frame_dir.glob("*.png"):
+                png_path.unlink()
+            try:
+                frame_dir.rmdir()
+            except OSError:
+                pass
+            print(f"Trajectory retained: {traj_path}")
 
         return
