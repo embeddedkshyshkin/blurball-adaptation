@@ -1,151 +1,403 @@
-"""Calibration helpers shared by the gravity-constrained ball solver.
+from __future__ import annotations
 
-The solver works in PongEye's table frame: ``+x`` along the table, ``+y``
-across it, and ``+z`` away from the playing surface.  This module deliberately
-only normalises calibration input; it does not choose or tune a motion model.
+"""Physics-based ball speed/direction estimation.
+
+The important difference from a simple homography derivative is that an airborne
+ball is reconstructed in a per-flight vertical plane when camera intrinsics are
+available.  The plane is chosen by reprojection error plus a gravity constraint,
+then position is smoothed with a local polynomial and differentiated.
+
+Without solved intrinsics the estimator falls back to the horizontal table-plane
+homography, which is exact only when the ball is on/near the table.
 """
 
+import math
 from dataclasses import dataclass
 import json
 from pathlib import Path
+from typing import Optional
 
 import cv2
 import numpy as np
 
+G = 9.80665
+MAX_SLOPE = 0.8
 
-@dataclass(frozen=True)
-class Calibration:
-    H: np.ndarray              # table metres (z=0) -> image pixels
-    H_inv: np.ndarray          # image pixels -> table metres (z=0)
-    K: np.ndarray | None       # table-frame camera intrinsics
-    R: np.ndarray | None       # table frame -> camera frame rotation
-    t: np.ndarray | None       # table-frame camera translation
-    cam_centre: np.ndarray | None
-    image_size: tuple[int, int]
+
+@dataclass
+class KinematicsCalibration:
+    H_table_to_image: np.ndarray
+    H_image_to_table: np.ndarray
+    K: Optional[np.ndarray]
+    R: Optional[np.ndarray]
+    t: Optional[np.ndarray]
+    camera_center: Optional[np.ndarray]
     length_m: float
     width_m: float
-    px_per_m: float
+    image_size: tuple[int, int] = (1920, 1080)
+    px_per_m: float = float("nan")
 
     @property
     def has_pose(self) -> bool:
         return self.K is not None and self.R is not None and self.t is not None
 
+    # Compatibility aliases for the loader-facing API.
+    @property
+    def H(self) -> np.ndarray:
+        return self.H_table_to_image
 
-def _as_matrix(values, name):
+    @property
+    def H_inv(self) -> np.ndarray:
+        return self.H_image_to_table
+
+    @property
+    def cam_centre(self) -> Optional[np.ndarray]:
+        return self.camera_center
+
+
+def _matrix(values, name: str) -> np.ndarray:
     if not isinstance(values, (list, tuple)) or len(values) != 9:
         raise ValueError(f"calibration JSON needs a 9-element '{name}'")
-    return np.asarray(values, dtype=float).reshape(3, 3)
+    return np.asarray(values, dtype=np.float64).reshape(3, 3)
 
 
-def _pongeye_homography(corners, length_m, width_m):
-    """Build table -> image H from PongEye's named table corners.
-
-    PongEye's extrinsics define bottomLeft as table origin, not topLeft.
-    Keeping that order makes the resulting plane agree with the supplied pose.
-    """
-    image_points = np.asarray([
-        [corners["bottomLeft"]["x"], corners["bottomLeft"]["y"]],
-        [corners["bottomRight"]["x"], corners["bottomRight"]["y"]],
-        [corners["topRight"]["x"], corners["topRight"]["y"]],
-        [corners["topLeft"]["x"], corners["topLeft"]["y"]],
-    ], dtype=np.float64)
-    table_points = np.asarray([
-        [0.0, 0.0], [length_m, 0.0],
-        [length_m, width_m], [0.0, width_m],
-    ], dtype=np.float64)
-    return cv2.getPerspectiveTransform(table_points.astype(np.float32), image_points.astype(np.float32))
-
-
-def _pose_from_homography(K, H):
-    """Recover table-frame pose for the older homography-only schema."""
-    M = np.linalg.inv(K) @ H
-    scale = 2.0 / (np.linalg.norm(M[:, 0]) + np.linalg.norm(M[:, 1]))
-    r1, r2, t = M[:, 0] * scale, M[:, 1] * scale, M[:, 2] * scale
-    if t[2] < 0:
-        r1, r2, t = -r1, -r2, -t
-    R = np.column_stack((r1, r2, np.cross(r1, r2)))
-    u, _, vt = np.linalg.svd(R)
-    R = u @ vt
-    if np.linalg.det(R) < 0:
-        R = u @ np.diag([1.0, 1.0, -1.0]) @ vt
-    return R, t
-
-
-def load_calibration(path: str | Path) -> Calibration:
-    """Load either the original solver schema or PongEye's recording schema."""
-    with Path(path).open("r", encoding="utf-8") as fh:
-        raw = json.load(fh)
-
+def calibration_from_pong_eye(raw: dict) -> KinematicsCalibration:
+    """Normalise legacy and current PongEye recording calibration schemas."""
     cal = raw.get("calibration", raw)
-    dims = cal.get("tableDimensions", {})
-    length_m = float(dims.get("lengthMeters", 2.74))
-    width_m = float(dims.get("widthMeters", 1.525))
-    px_per_m = float(raw.get("pixelsPerMetreAtTableCentre",
-                             cal.get("pixelsPerMetreAtTableCentre", float("nan"))))
+    dimensions = cal.get("tableDimensions", {})
+    length = float(dimensions.get("lengthMeters", 2.74))
+    width = float(dimensions.get("widthMeters", 1.525))
+    exposure = raw.get("exposure") or raw.get("device", {}).get("exposure", {})
+    size = raw.get("imageSize", {})
+    image_size = (int(exposure.get("width", size.get("width", 1920))),
+                  int(exposure.get("height", size.get("height", 1080))))
+    px_per_m = float(exposure.get("pixelsPerMetreAtTableCentre",
+                                 cal.get("pixelsPerMetreAtTableCentre", float("nan"))))
 
     if cal.get("homographyTableToImage") is not None:
-        H = _as_matrix(cal["homographyTableToImage"], "homographyTableToImage")
-    elif cal.get("corners") is not None:
-        H = _pongeye_homography(cal["corners"], length_m, width_m)
+        H_table_to_image = _matrix(cal["homographyTableToImage"], "homographyTableToImage")
     else:
-        raise ValueError("calibration JSON needs 'homographyTableToImage' or 'calibration.corners'")
-    H /= H[2, 2]
-
-    # Recordings written by PongEye have used both top-level ``exposure`` and
-    # ``device.exposure``. They carry the same camera calibration fields.
-    exposure = raw.get("exposure") or raw.get("device", {}).get("exposure", {})
-    if not np.isfinite(px_per_m):
-        px_per_m = float(exposure.get("pixelsPerMetreAtTableCentre", float("nan")))
-    image = raw.get("imageSize", {})
-    image_size = (
-        int(exposure.get("width", image.get("width", 1920))),
-        int(exposure.get("height", image.get("height", 1080))),
-    )
+        corners = cal.get("corners")
+        if corners is None:
+            raise ValueError("calibration JSON needs 'homographyTableToImage' or 'calibration.corners'")
+        # The pose uses bottomLeft as table origin: +x runs along the table and
+        # +y runs across it. This ordering agrees with PongEye R/t directly.
+        image_points = np.array([
+            [corners["bottomLeft"]["x"], corners["bottomLeft"]["y"]],
+            [corners["bottomRight"]["x"], corners["bottomRight"]["y"]],
+            [corners["topRight"]["x"], corners["topRight"]["y"]],
+            [corners["topLeft"]["x"], corners["topLeft"]["y"]],
+        ], dtype=np.float32)
+        table_points = np.array([[0, 0], [length, 0], [length, width], [0, width]], dtype=np.float32)
+        H_table_to_image = cv2.getPerspectiveTransform(table_points, image_points)
+    H_table_to_image /= H_table_to_image[2, 2]
 
     K = R = t = centre = None
-    intr = raw.get("solvedIntrinsics") or exposure.get("extrinsicsIntrinsics") or {}
-    if intr:
-        fx = intr.get("focalLengthXPx", intr.get("focalLengthPx"))
-        fy = intr.get("focalLengthYPx", intr.get("focalLengthPx", fx))
-        if fx is not None and fy is not None:
-            K = np.array([
-                [float(fx), 0.0, float(intr.get("principalPointXPx", image_size[0] / 2))],
-                [0.0, float(fy), float(intr.get("principalPointYPx", image_size[1] / 2))],
-                [0.0, 0.0, 1.0],
-            ])
-            extrinsics = exposure.get("extrinsics") or raw.get("extrinsics") or {}
-            if extrinsics.get("rotation") is not None and extrinsics.get("translationMetres") is not None:
-                R = _as_matrix(extrinsics["rotation"], "rotation")
-                t = np.asarray(extrinsics["translationMetres"], dtype=float)
-                if t.shape != (3,):
-                    raise ValueError("calibration JSON needs a 3-element 'translationMetres'")
+    intr = raw.get("solvedIntrinsics") or cal.get("solvedIntrinsics") or exposure.get("extrinsicsIntrinsics") or {}
+    fx = intr.get("focalLengthXPx", intr.get("focalLengthPx"))
+    fy = intr.get("focalLengthYPx", intr.get("focalLengthPx", fx))
+    if fx is not None and fy is not None:
+        cx = float(intr.get("principalPointXPx", image_size[0] / 2))
+        cy = float(intr.get("principalPointYPx", image_size[1] / 2))
+        K = np.array([[float(fx), 0, cx], [0, float(fy), cy], [0, 0, 1]], dtype=np.float64)
+        extrinsics = exposure.get("extrinsics") or raw.get("extrinsics") or {}
+        if extrinsics.get("rotation") is not None and extrinsics.get("translationMetres") is not None:
+            R = _matrix(extrinsics["rotation"], "rotation")
+            t = np.asarray(extrinsics["translationMetres"], dtype=np.float64)
+            if t.shape != (3,):
+                raise ValueError("calibration JSON needs a 3-element 'translationMetres'")
+        else:
+            R, t = _pose_from_homography(K, H_table_to_image)
+        centre = -R.T @ t
+        declared = extrinsics.get("cameraPositionMetres")
+        if declared is not None and not np.allclose(centre, np.asarray(declared, dtype=np.float64), atol=1e-3):
+            raise ValueError("PongEye camera pose is inconsistent: -R.T @ t != cameraPositionMetres")
+
+    return KinematicsCalibration(H_table_to_image, np.linalg.inv(H_table_to_image), K, R, t, centre,
+                                 length, width, image_size, px_per_m)
+
+
+def load_calibration(path: str | Path) -> KinematicsCalibration:
+    with Path(path).open("r", encoding="utf-8") as handle:
+        return calibration_from_pong_eye(json.load(handle))
+
+
+def _pose_from_homography(K: np.ndarray, H_table_to_image: np.ndarray):
+    M = np.linalg.inv(K) @ H_table_to_image
+    lam = 2.0 / (np.linalg.norm(M[:, 0]) + np.linalg.norm(M[:, 1]))
+    r1, r2, tv = M[:, 0] * lam, M[:, 1] * lam, M[:, 2] * lam
+    if tv[2] < 0:
+        r1, r2, tv = -r1, -r2, -tv
+    R = np.column_stack([r1, r2, np.cross(r1, r2)])
+    U, _, Vt = np.linalg.svd(R)
+    R = U @ Vt
+    if np.linalg.det(R) < 0:
+        R = U @ np.diag([1.0, 1.0, -1.0]) @ Vt
+    return R, tv
+
+
+def _rays_world(cal: KinematicsCalibration, uv: np.ndarray) -> np.ndarray:
+    uv = np.atleast_2d(np.asarray(uv, dtype=np.float64))
+    hom = np.column_stack([uv, np.ones(len(uv))])
+    d_cam = hom @ np.linalg.inv(cal.K).T
+    return d_cam @ cal.R
+
+
+def _vertical_points(cal: KinematicsCalibration, uv: np.ndarray, y0: float, slope: float):
+    d = _rays_world(cal, uv)
+    c = cal.camera_center
+    denom = d[:, 1] - slope * d[:, 0]
+    if np.any(np.abs(denom) < 1e-9):
+        return None
+    s = (y0 + slope * c[0] - c[1]) / denom
+    P = c[None, :] + s[:, None] * d
+    return P if np.isfinite(P).all() else None
+
+
+def _project(cal: KinematicsCalibration, X: np.ndarray):
+    cam = X @ cal.R.T + cal.t[None, :]
+    if np.any(cam[:, 2] <= 1e-6):
+        return None
+    img = cam @ cal.K.T
+    return img[:, :2] / img[:, 2:3]
+
+
+def _horizontal_points(cal: KinematicsCalibration, uv: np.ndarray):
+    uv = np.atleast_2d(np.asarray(uv, dtype=np.float64))
+    p = np.column_stack([uv, np.ones(len(uv))]) @ cal.H_image_to_table.T
+    w = p[:, 2]
+    w[np.abs(w) < 1e-12] = np.nan
+    return np.column_stack([p[:, 0] / w, p[:, 1] / w, np.zeros(len(p))])
+
+
+def _local_poly_state(t, y, half_window=3, degree=2):
+    n = len(t)
+    value = np.empty(n, dtype=np.float64)
+    derivative = np.empty(n, dtype=np.float64)
+    for i in range(n):
+        lo, hi = max(0, i - half_window), min(n, i + half_window + 1)
+        ts = t[lo:hi] - t[i]
+        ys = y[lo:hi]
+        deg = min(degree, len(ts) - 1)
+        if deg < 1:
+            value[i], derivative[i] = y[i], 0.0
+            continue
+        span = max(float(np.max(np.abs(ts))), 1e-9)
+        w = np.clip((1.0 - np.abs(ts / span) ** 3) ** 3, 1e-3, None)
+        V = np.vander(ts, deg + 1, increasing=True)
+        try:
+            coef, *_ = np.linalg.lstsq(V * w[:, None], ys * w, rcond=None)
+            value[i], derivative[i] = coef[0], coef[1]
+        except np.linalg.LinAlgError:
+            value[i], derivative[i] = y[i], 0.0
+    return value, derivative
+
+
+def _plane_cost(cal, uv, t, y0, slope, bounds, gravity_weight=3.0):
+    if not (bounds[0] <= y0 <= bounds[1]) or abs(slope) > MAX_SLOPE:
+        return float("inf")
+    P = _vertical_points(cal, uv, y0, slope)
+    if P is None or np.min(np.linalg.norm(P - cal.camera_center[None, :], axis=1)) < 0.35:
+        return float("inf")
+    if np.max(np.abs(P[:, 0])) > 25 or np.max(np.abs(P[:, 2])) > 10:
+        return float("inf")
+
+    n = len(t)
+    w = min(7, n)
+    stride = max(1, (n - w) // 8 + 1)
+    pixel_errors = []
+    gravity_errors = []
+    for a in range(0, n - w + 1, stride):
+        b = a + w
+        tt, xx, zz = t[a:b], P[a:b, 0], P[a:b, 2]
+        A = np.column_stack([np.ones_like(tt), tt - tt[0]])
+        cx, *_ = np.linalg.lstsq(A, xx, rcond=None)
+        z_linear, *_ = np.linalg.lstsq(A, zz + 0.5 * G * (tt - tt[0]) ** 2, rcond=None)
+        x_fit = A @ cx
+        z_fit = A @ z_linear - 0.5 * G * (tt - tt[0]) ** 2
+        model = np.column_stack([x_fit, y0 + slope * x_fit, z_fit])
+        uv_fit = _project(cal, model)
+        if uv_fit is None:
+            return float("inf")
+        pixel_errors.append(float(np.sqrt(np.mean(np.sum((uv_fit - uv[a:b]) ** 2, axis=1)))))
+        if w >= 4:
+            coef = np.polyfit(tt - tt[0], zz, 2)
+            gravity_errors.append(abs((2.0 * coef[0]) + G) / G)
+
+    if not pixel_errors:
+        return float("inf")
+    cost = float(np.median(pixel_errors))
+    if gravity_errors:
+        cost *= 1.0 + gravity_weight * float(np.median(gravity_errors))
+    cost *= 1.0 + 0.6 * max(0.0, -y0, y0 - cal.width_m)
+    return cost
+
+
+def _solve_vertical_plane(cal, uv, t, margin=1.0, gravity_weight=3.0):
+    bounds = (-margin, cal.width_m + margin)
+    # Coarse-to-fine deterministic search. This avoids making scipy a runtime
+    # requirement while retaining the important physical optimisation.
+    best = (float("inf"), cal.width_m / 2.0, 0.0)
+    for y0 in np.linspace(bounds[0], bounds[1], 17):
+        for slope in np.linspace(-MAX_SLOPE, MAX_SLOPE, 9):
+            c = _plane_cost(cal, uv, t, y0, slope, bounds, gravity_weight)
+            if c < best[0]:
+                best = (c, float(y0), float(slope))
+
+    if not math.isfinite(best[0]):
+        return None
+
+    # Three local refinements around the best grid point.
+    y0, slope = best[1], best[2]
+    dy = (bounds[1] - bounds[0]) / 16.0
+    ds = 2.0 * MAX_SLOPE / 8.0
+    for _ in range(3):
+        candidates = []
+        for yy in np.linspace(y0 - dy, y0 + dy, 5):
+            for ss in np.linspace(slope - ds, slope + ds, 5):
+                c = _plane_cost(cal, uv, t, float(yy), float(ss), bounds, gravity_weight)
+                candidates.append((c, float(yy), float(ss)))
+        c, y0, slope = min(candidates, key=lambda x: x[0])
+        dy *= 0.25
+        ds *= 0.25
+
+    P = _vertical_points(cal, uv, y0, slope)
+    if P is None:
+        return None
+
+    # Final physical/reprojection quality checks.
+    rms_m = float("inf")
+    px_rms = float("inf")
+    w = min(7, len(t))
+    if w >= 3:
+        residuals_m = []
+        residuals_px = []
+        for a in range(0, len(t) - w + 1, max(1, (len(t) - w) // 8 + 1)):
+            b = a + w
+            tt, xx, zz = t[a:b], P[a:b, 0], P[a:b, 2]
+            A = np.column_stack([np.ones_like(tt), tt - tt[0]])
+            cx, *_ = np.linalg.lstsq(A, xx, rcond=None)
+            cz, *_ = np.linalg.lstsq(A, zz + 0.5 * G * (tt - tt[0]) ** 2, rcond=None)
+            xfit = A @ cx
+            zfit = A @ cz - 0.5 * G * (tt - tt[0]) ** 2
+            residuals_m.extend(np.sqrt((xx - xfit) ** 2 + (zz - zfit) ** 2))
+            uvfit = _project(cal, np.column_stack([xfit, y0 + slope * xfit, zfit]))
+            if uvfit is not None:
+                residuals_px.extend(np.linalg.norm(uvfit - uv[a:b], axis=1))
+        if residuals_m:
+            rms_m = float(np.sqrt(np.mean(np.square(residuals_m))))
+        if residuals_px:
+            px_rms = float(np.sqrt(np.mean(np.square(residuals_px))))
+
+    if rms_m > 0.25 or px_rms > 8.0:
+        return None
+    return P, y0, slope, rms_m, px_rms
+
+
+def _segment(frames, uv, max_gap=3, max_px_step=140.0):
+    groups, cur = [], [0]
+    for i in range(1, len(frames)):
+        df = int(frames[i] - frames[i - 1])
+        step = float(np.linalg.norm(uv[i] - uv[i - 1]))
+        if df <= 0 or df > max_gap or step / max(df, 1) > max_px_step:
+            groups.append(np.asarray(cur, dtype=int))
+            cur = [i]
+        else:
+            cur.append(i)
+    groups.append(np.asarray(cur, dtype=int))
+    return groups
+
+
+def _prune(frames, uv, max_px_step=140.0, accel_px_frame2=45.0):
+    keep = np.ones(len(frames), dtype=bool)
+    for i in range(2, len(frames)):
+        prev = np.flatnonzero(keep[:i])
+        if len(prev) < 2:
+            continue
+        a, b = prev[-2], prev[-1]
+        d1, d2 = frames[b] - frames[a], frames[i] - frames[b]
+        if d1 <= 0 or d2 <= 0:
+            continue
+        v = (uv[b] - uv[a]) / d1
+        residual = float(np.linalg.norm(uv[i] - (uv[b] + v * d2)))
+        if residual > 0.5 * accel_px_frame2 * d2 * d2 + 12.0 or np.linalg.norm(uv[i] - uv[b]) / d2 > max_px_step:
+            keep[i] = False
+    return keep
+
+
+class BallKinematicsEstimator:
+    """Estimate per-frame speed and heading from a complete trajectory."""
+
+    def __init__(self, calibration: KinematicsCalibration, fps: float,
+                 half_window: int = 3, degree: int = 2,
+                 min_track: int = 8, margin: float = 1.0,
+                 gravity_weight: float = 3.0):
+        self.cal = calibration
+        self.fps = float(fps)
+        self.half_window = int(max(1, half_window))
+        self.degree = int(max(1, degree))
+        self.min_track = int(max(4, min_track))
+        self.margin = float(margin)
+        self.gravity_weight = float(gravity_weight)
+
+    def estimate(self, frames: np.ndarray, uv: np.ndarray, visibility: np.ndarray):
+        frames = np.asarray(frames, dtype=int)
+        uv = np.asarray(uv, dtype=float)
+        visibility = np.asarray(visibility, dtype=bool)
+        speed = np.zeros(len(frames), dtype=float)
+        heading = np.full(len(frames), np.nan, dtype=float)
+        mode = np.full(len(frames), "none", dtype=object)
+        confidence = np.zeros(len(frames), dtype=float)
+
+        visible_idx = np.flatnonzero(visibility & np.isfinite(uv).all(axis=1))
+        if len(visible_idx) < self.min_track:
+            return speed, heading, mode, confidence
+
+        vf, vu = frames[visible_idx], uv[visible_idx]
+        for group in _segment(vf, vu):
+            if len(group) < self.min_track:
+                continue
+            f, p = vf[group], vu[group]
+            keep = _prune(f, p)
+            f, p = f[keep], p[keep]
+            if len(f) < self.min_track:
+                continue
+            t = f.astype(float) / self.fps
+
+            solved = None
+            if self.cal.has_pose:
+                solved = _solve_vertical_plane(self.cal, p, t, self.margin, self.gravity_weight)
+
+            if solved is not None:
+                P = solved[0]
+                fit_quality = max(0.0, 1.0 - solved[4] / 8.0)
+                track_mode = "vertical"
             else:
-                R, t = _pose_from_homography(K, H)
-            centre = -R.T @ t
-            declared_centre = extrinsics.get("cameraPositionMetres")
-            if declared_centre is not None:
-                declared_centre = np.asarray(declared_centre, dtype=float)
-                if declared_centre.shape != (3,):
-                    raise ValueError("calibration JSON needs a 3-element 'cameraPositionMetres'")
-                # The declared centre is a useful integrity check, but R/t are
-                # authoritative because they are the projection pose.
-                if not np.allclose(centre, declared_centre, atol=1e-3):
-                    raise ValueError("PongEye camera pose is inconsistent: -R.T @ t != cameraPositionMetres")
+                P = _horizontal_points(self.cal, p)
+                fit_quality = 0.35
+                track_mode = "plane"
 
-    return Calibration(H, np.linalg.inv(H), K, R, t, centre, image_size,
-                       length_m, width_m, px_per_m)
+            if P is None or not np.isfinite(P).all():
+                continue
 
+            tt = t
+            smoothed = np.column_stack([
+                _local_poly_state(tt, P[:, k], self.half_window, self.degree)[0]
+                for k in range(3)
+            ])
+            V = np.column_stack([
+                _local_poly_state(tt, P[:, k], self.half_window, self.degree)[1]
+                for k in range(3)
+            ])
+            speed_mps = np.linalg.norm(V, axis=1)
+            hd = np.degrees(np.arctan2(V[:, 1], V[:, 0]))
 
-def pixels_to_height_plane(calibration: Calibration, uv, height_m: float):
-    """Back-project pixels to a horizontal table-frame plane.
+            # Reject derivative estimates that are dominated by numerical noise.
+            reliable = np.isfinite(speed_mps) & (speed_mps >= 0.25)
+            for j, original in enumerate(visible_idx[group][keep]):
+                speed[original] = float(speed_mps[j] * 3.6) if reliable[j] else 0.0
+                heading[original] = float(hd[j]) if reliable[j] else np.nan
+                mode[original] = track_mode
+                confidence[original] = fit_quality
 
-    This is the pose interface consumed by the existing 3-D solver.
-    """
-    uv = np.atleast_2d(np.asarray(uv, dtype=float))
-    if height_m == 0.0 or not calibration.has_pose:
-        p = np.c_[uv, np.ones(len(uv))] @ calibration.H_inv.T
-        return np.c_[p[:, :2] / p[:, 2:3], np.full(len(p), height_m)]
-    directions_camera = np.c_[uv, np.ones(len(uv))] @ np.linalg.inv(calibration.K).T
-    directions_world = directions_camera @ calibration.R
-    scale = (height_m - calibration.cam_centre[2]) / directions_world[:, 2]
-    return calibration.cam_centre + scale[:, None] * directions_world
+        return speed, heading, mode, confidence

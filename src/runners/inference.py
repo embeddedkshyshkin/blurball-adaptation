@@ -25,7 +25,7 @@ from utils import mkdir_if_missing, draw_frame, draw_speed_direction_hud, gen_vi
 from utils.image import get_affine_transform, affine_transform
 from utils.preprocess import process_video
 from utils.motion import MotionEstimator
-from utils.ball_kinematics import load_calibration
+from utils.ball_kinematics import BallKinematicsEstimator, load_calibration
 
 from .base import BaseRunner
 
@@ -43,7 +43,40 @@ def load_speed_calibration(calibration_file):
     if not path.is_absolute():
         path = Path(HydraConfig.get().runtime.cwd) / path
 
-    return load_calibration(path).H_inv
+    return load_calibration(path).H_image_to_table
+
+
+def _motion_states_from_trajectory(result_dict, fps, calibration_file, vis_cfg):
+    """Run the existing gravity-constrained solver over one segment trajectory."""
+    if not calibration_file:
+        return None
+    try:
+        calibration = load_calibration(calibration_file)
+    except Exception as exc:
+        print(f"3D kinematics unavailable: {exc}")
+        return None
+    if not calibration.has_pose:
+        return None
+
+    paths = list(result_dict)
+    frames = np.arange(len(paths))
+    uv = np.array([[result_dict[path]["x"], result_dict[path]["y"]] for path in paths], dtype=float)
+    visibility = np.array([bool(result_dict[path]["visi"]) for path in paths])
+    estimator = BallKinematicsEstimator(
+        calibration, fps=float(fps),
+        half_window=max(2, int(vis_cfg.get("speed_window_frames", 9)) // 2),
+        degree=min(2, max(1, int(vis_cfg.get("kinematics_polynomial_degree", 2)))),
+        min_track=max(8, int(vis_cfg.get("kinematics_min_track", 12))),
+        margin=float(vis_cfg.get("kinematics_plane_margin_m", 1.0)),
+        gravity_weight=float(vis_cfg.get("kinematics_gravity_weight", 3.0)),
+    )
+    speed, heading_deg, mode, _ = estimator.estimate(frames, uv, visibility)
+    if not np.any(mode == "vertical"):
+        return None
+    return {
+        path: (float(speed[i]), float(np.deg2rad(heading_deg[i])) if np.isfinite(heading_deg[i]) else None)
+        for i, path in enumerate(paths) if visibility[i]
+    }
 
 
 def project_to_table(point_xy, homography):
@@ -186,25 +219,32 @@ def inference_video(
 
     speed_homography = preloaded_speed_homography
     motion_estimator = None
+    kinematic_states = None
     if show_speed_direction:
         if not calibration_file:
             print("Calibration not provided; speed/direction calculation is disabled")
             show_speed_direction = False
         else:
-            if speed_homography is None:
+            kinematic_states = _motion_states_from_trajectory(
+                result_dict, fps, calibration_file, vis_cfg
+            )
+            if kinematic_states is not None:
+                print("Using gravity-constrained 3D kinematics for speed/direction")
+            elif speed_homography is None:
                 speed_homography = load_speed_calibration(calibration_file)
                 print("Loaded PongEye calibration from " + str(calibration_file))
-            motion_estimator = MotionEstimator(
-                fps=fps,
-                speed_window_frames=speed_window,
-                direction_window_frames=direction_window,
-                speed_smoothing_alpha=smoothing_alpha,
-                direction_change_threshold_deg=direction_change_threshold_deg,
-                min_displacement_m=direction_min_distance_m,
-                min_speed_kmh=min_speed_kmh,
-                reversal_confirm_frames=reversal_confirm_frames,
-                direction_smoothing_alpha=direction_smoothing_alpha,
-            )
+            if kinematic_states is None:
+                motion_estimator = MotionEstimator(
+                    fps=fps,
+                    speed_window_frames=speed_window,
+                    direction_window_frames=direction_window,
+                    speed_smoothing_alpha=smoothing_alpha,
+                    direction_change_threshold_deg=direction_change_threshold_deg,
+                    min_displacement_m=direction_min_distance_m,
+                    min_speed_kmh=min_speed_kmh,
+                    reversal_confirm_frames=reversal_confirm_frames,
+                    direction_smoothing_alpha=direction_smoothing_alpha,
+                )
 
     for cnt, img_path in enumerate(result_dict.keys()):
         x_pred = result_dict[img_path]["x"]
@@ -224,7 +264,9 @@ def inference_video(
 
         current_speed_kmh = 0.0
         current_direction_rad = None
-        if motion_estimator is not None and visi_pred:
+        if kinematic_states is not None and visi_pred:
+            current_speed_kmh, current_direction_rad = kinematic_states.get(img_path, (0.0, None))
+        elif motion_estimator is not None and visi_pred:
             table_position = project_to_table((float(x_pred), float(y_pred)), speed_homography)
             current_speed_kmh, current_direction_rad = motion_estimator.update(cnt, table_position)
         elif motion_estimator is not None:

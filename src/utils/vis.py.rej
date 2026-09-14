@@ -1,0 +1,12 @@
+diff a/src/utils/vis.py b/src/utils/vis.py	(rejected hunks)
+@@ -18,7 +18,9 @@ def draw_frame(
+     angle=None,
+     l=None,
+ ):
+-    if osp.isfile(img_or_path):
++    if isinstance(img_or_path, np.ndarray):
++        img = img_or_path
++    elif isinstance(img_or_path, (str, bytes, os.PathLike)) and osp.isfile(img_or_path):
+         img = cv2.imread(img_or_path)
+     else:
+         img = img_or_path
