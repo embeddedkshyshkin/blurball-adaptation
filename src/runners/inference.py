@@ -25,6 +25,13 @@ from utils import mkdir_if_missing, draw_frame, draw_speed_direction_hud, gen_vi
 from utils.image import get_affine_transform, affine_transform
 from utils.preprocess import process_video
 from utils.motion import MotionEstimator
+from utils.ball_kinematics import (
+    load_calibration as load_kinematics_calibration,
+    segment_pixels,
+    prune_pixel_outliers,
+    solve_vertical_plane,
+    analyse as analyse_kinematics,
+)
 
 from .base import BaseRunner
 
@@ -72,6 +79,147 @@ def project_to_table(point_xy, homography):
     point = np.array([[point_xy]], dtype=np.float32)
     projected = cv2.perspectiveTransform(point, homography)[0, 0]
     return float(projected[0]), float(projected[1])
+
+
+def _motion_states_from_trajectory(result_dict, fps, calibration_file, vis_cfg):
+    """Estimate per-frame physical 3-D speed/direction from the whole trajectory.
+
+    Unlike the old online estimator, this is deliberately offline: all visible
+    detections are available before the HUD is rendered.  That lets us solve
+    the vertical flight plane using camera pose + gravity, then use a local
+    polynomial derivative on the reconstructed 3-D trajectory.  Airborne balls
+    therefore are not incorrectly assumed to lie on the table plane.
+
+    Returns {image_path: (speed_kmh, heading_rad)}. If solved intrinsics are not
+    available, returns None so the caller can use the calibrated table-plane
+    fallback.
+    """
+    if not calibration_file:
+        return None
+
+    try:
+        path = Path(calibration_file)
+        if not path.is_absolute():
+            path = Path(HydraConfig.get().runtime.cwd) / path
+        cal = load_kinematics_calibration(str(path))
+    except Exception as exc:
+        print(f"3D kinematics unavailable: {exc}")
+        return None
+
+    if not cal.has_pose:
+        print("3D kinematics unavailable: calibration has no solvedIntrinsics; using table-plane fallback")
+        return None
+
+    visible = []
+    paths = []
+    for frame_index, (img_path, result) in enumerate(result_dict.items()):
+        if not int(result["visi"]):
+            continue
+        x = float(result["x"])
+        y = float(result["y"])
+        if not (np.isfinite(x) and np.isfinite(y)):
+            continue
+        if x <= 0 and y <= 0:
+            continue
+        visible.append((frame_index, x, y))
+        paths.append(img_path)
+
+    if len(visible) < 8:
+        print("3D kinematics: not enough visible detections; using table-plane fallback")
+        return None
+
+    frames = np.asarray([v[0] for v in visible], dtype=int)
+    uv = np.asarray([[v[1], v[2]] for v in visible], dtype=float)
+    groups = segment_pixels(
+        frames,
+        uv,
+        max_gap=int(vis_cfg.get("kinematics_max_gap", 3)),
+        max_px_per_frame=float(vis_cfg.get("kinematics_max_px_step", 140.0)),
+    )
+
+    speed_window = max(5, int(vis_cfg.get("speed_window_frames", 9)))
+    half_window = max(2, speed_window // 2)
+    degree = min(2, max(1, int(vis_cfg.get("kinematics_polynomial_degree", 2))))
+    min_track = max(8, int(vis_cfg.get("kinematics_min_track", 12)))
+    margin = float(vis_cfg.get("kinematics_plane_margin_m", 1.0))
+    max_fit_rms = float(vis_cfg.get("kinematics_max_fit_rms_m", 0.25))
+    max_reproj_px = float(vis_cfg.get("kinematics_max_reproj_px", 8.0))
+    max_px_accel = float(vis_cfg.get("kinematics_max_px_accel", 45.0))
+    gravity_weight = float(vis_cfg.get("kinematics_gravity_weight", 3.0))
+
+    # ball_kinematics uses a module global for the gravity weight. Set it here
+    # instead of duplicating the reconstruction implementation.
+    import utils.ball_kinematics as bk
+    bk.GRAVITY_WEIGHT = gravity_weight
+
+    states = {}
+    kept_tracks = 0
+    rejected_tracks = 0
+
+    for group in groups:
+        if len(group) < min_track:
+            continue
+        f = frames[group]
+        p = uv[group]
+        keep = prune_pixel_outliers(f, p, float(vis_cfg.get("kinematics_max_px_step", 140.0)), max_px_accel)
+        f = f[keep]
+        p = p[keep]
+        if len(f) < min_track:
+            continue
+
+        t = f.astype(float) / float(fps)
+        y0, slope, fit_rms, reproj_rms, P = solve_vertical_plane(
+            cal, p, t, cal.width_m, margin
+        )
+        if P is None or not np.isfinite(P).all():
+            rejected_tracks += 1
+            continue
+        if fit_rms > max_fit_rms or reproj_rms > max_reproj_px:
+            rejected_tracks += 1
+            continue
+
+        track = analyse_kinematics(
+            kept_tracks + 1,
+            f,
+            p,
+            P,
+            float(fps),
+            half_window,
+            degree,
+            extra={
+                "plane_y0_m": y0,
+                "plane_slope": slope,
+                "fit_rms_m": fit_rms,
+                "reproj_rms_px": reproj_rms,
+            },
+        )
+        kept_tracks += 1
+
+        # analyse() produces the velocity tangent at each retained detection.
+        # Map it back to the original image path through frame index.
+        frame_to_path = {int(frames[group][i]): paths[group[i]] for i in range(len(group)) if keep[i]}
+        # The expression above cannot be used after filtering by position when
+        # group and keep differ, so construct the mapping explicitly below.
+        kept_group_positions = np.flatnonzero(keep)
+        for local_i, original_group_pos in enumerate(kept_group_positions):
+            frame_no = int(frames[group[original_group_pos]])
+            img_path = paths[np.flatnonzero(frames == frame_no)[0]]
+            speed = float(track.speed[local_i]) * 3.6
+            vx, vy = float(track.V[local_i, 0]), float(track.V[local_i, 1])
+            horizontal = float(np.hypot(vx, vy))
+            if horizontal < 1e-6 or not np.isfinite(speed):
+                heading = None
+            else:
+                heading = float(np.arctan2(vy, vx))
+            states[img_path] = (max(0.0, speed), heading)
+
+    print(
+        f"3D kinematics: {kept_tracks} flight track(s) kept, "
+        f"{rejected_tracks} rejected by physical/reprojection fit"
+    )
+    if not states:
+        return None
+    return states
 
 
 def load_trajectory(traj_path, imgs_paths, model_name):
@@ -193,36 +341,46 @@ def inference_video(
     vis_cfg = cfg.get("runner", {}).get("visualization", {})
     show_speed_direction = bool(vis_cfg.get("show_speed_direction", False))
     calibration_file = cfg.get("calibration_file", None)
-    speed_window = max(3, int(vis_cfg.get("speed_window_frames", 7)))
+    speed_window = max(3, int(vis_cfg.get("speed_window_frames", 9)))
     direction_window = max(3, int(vis_cfg.get("direction_window_frames", 5)))
-    smoothing_alpha = float(vis_cfg.get("speed_smoothing_alpha", 0.25))
-    direction_change_threshold_deg = float(vis_cfg.get("direction_change_threshold_deg", 115.0))
-    direction_min_distance_m = float(vis_cfg.get("direction_min_distance_m", 0.015))
-    min_speed_kmh = float(vis_cfg.get("direction_min_speed_kmh", 2.0))
-    reversal_confirm_frames = max(1, int(vis_cfg.get("reversal_confirm_frames", 3)))
-    direction_smoothing_alpha = float(vis_cfg.get("direction_smoothing_alpha", 0.35))
+    smoothing_alpha = float(vis_cfg.get("speed_smoothing_alpha", 0.35))
+    direction_change_threshold_deg = float(vis_cfg.get("direction_change_threshold_deg", 95.0))
+    direction_min_distance_m = float(vis_cfg.get("direction_min_distance_m", 0.012))
+    min_speed_kmh = float(vis_cfg.get("direction_min_speed_kmh", 3.0))
+    reversal_confirm_frames = max(1, int(vis_cfg.get("reversal_confirm_frames", 2)))
+    direction_smoothing_alpha = float(vis_cfg.get("direction_smoothing_alpha", 1.0))
     hud_position = vis_cfg.get("hud_position", "top_center")
 
     speed_homography = None
     motion_estimator = None
+    kinematic_states = None
     if show_speed_direction:
         if not calibration_file:
             print("Calibration not provided; speed/direction calculation is disabled")
             show_speed_direction = False
         else:
-            speed_homography = load_speed_calibration(calibration_file)
-            print("Loaded PongEye calibration from " + str(calibration_file))
-            motion_estimator = MotionEstimator(
-                fps=fps,
-                speed_window_frames=speed_window,
-                direction_window_frames=direction_window,
-                speed_smoothing_alpha=smoothing_alpha,
-                direction_change_threshold_deg=direction_change_threshold_deg,
-                min_displacement_m=direction_min_distance_m,
-                min_speed_kmh=min_speed_kmh,
-                reversal_confirm_frames=reversal_confirm_frames,
-                direction_smoothing_alpha=direction_smoothing_alpha,
+            # Preferred path: reconstruct the airborne ball in 3-D using camera
+            # pose + gravity. This is fundamentally more correct than projecting
+            # an airborne ball onto z=0 with a table homography.
+            kinematic_states = _motion_states_from_trajectory(
+                result_dict, fps, calibration_file, vis_cfg
             )
+            if kinematic_states is not None:
+                print("Using gravity-constrained 3D kinematics for speed/direction")
+            else:
+                speed_homography = load_speed_calibration(calibration_file)
+                print("Using calibrated table-plane fallback for speed/direction")
+                motion_estimator = MotionEstimator(
+                    fps=fps,
+                    speed_window_frames=speed_window,
+                    direction_window_frames=direction_window,
+                    speed_smoothing_alpha=smoothing_alpha,
+                    direction_change_threshold_deg=direction_change_threshold_deg,
+                    min_displacement_m=direction_min_distance_m,
+                    min_speed_kmh=min_speed_kmh,
+                    reversal_confirm_frames=reversal_confirm_frames,
+                    direction_smoothing_alpha=direction_smoothing_alpha,
+                )
 
     for cnt, img_path in enumerate(result_dict.keys()):
         x_pred = result_dict[img_path]["x"]
@@ -242,7 +400,9 @@ def inference_video(
 
         current_speed_kmh = 0.0
         current_direction_rad = None
-        if motion_estimator is not None and visi_pred:
+        if kinematic_states is not None and visi_pred:
+            current_speed_kmh, current_direction_rad = kinematic_states.get(img_path, (0.0, None))
+        elif motion_estimator is not None and visi_pred:
             table_position = project_to_table((float(x_pred), float(y_pred)), speed_homography)
             current_speed_kmh, current_direction_rad = motion_estimator.update(cnt, table_position)
         elif motion_estimator is not None:
