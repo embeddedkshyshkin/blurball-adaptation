@@ -1,8 +1,8 @@
 import os
 import os.path as osp
-import json
 import matplotlib.pyplot as plt
 import shutil
+import tempfile
 import torchvision.transforms as T
 import pandas as pd
 from pathlib import Path
@@ -25,12 +25,17 @@ from utils import mkdir_if_missing, draw_frame, draw_speed_direction_hud, gen_vi
 from utils.image import get_affine_transform, affine_transform
 from utils.preprocess import process_video
 from utils.motion import MotionEstimator
+from utils.ball_kinematics import load_calibration
 
 from .base import BaseRunner
 
 
 def load_speed_calibration(calibration_file):
-    """Load PongEye table calibration and build image -> table homography."""
+    """Load calibration and return the image -> table-plane homography.
+
+    ``load_calibration`` also retains K/R/t for the gravity-constrained solver.
+    This compatibility wrapper keeps the current 2-D motion fallback unchanged.
+    """
     if not calibration_file:
         return None
 
@@ -38,34 +43,7 @@ def load_speed_calibration(calibration_file):
     if not path.is_absolute():
         path = Path(HydraConfig.get().runtime.cwd) / path
 
-    with path.open("r", encoding="utf-8") as f:
-        calibration = json.load(f)
-
-    data = calibration["calibration"]
-    corners = data["corners"]
-    length_m = float(data["tableDimensions"]["lengthMeters"])
-    width_m = float(data["tableDimensions"]["widthMeters"])
-
-    image_points = np.array(
-        [
-            [corners["topLeft"]["x"], corners["topLeft"]["y"]],
-            [corners["topRight"]["x"], corners["topRight"]["y"]],
-            [corners["bottomRight"]["x"], corners["bottomRight"]["y"]],
-            [corners["bottomLeft"]["x"], corners["bottomLeft"]["y"]],
-        ],
-        dtype=np.float32,
-    )
-    table_points = np.array(
-        [
-            [0.0, 0.0],
-            [length_m, 0.0],
-            [length_m, width_m],
-            [0.0, width_m],
-        ],
-        dtype=np.float32,
-    )
-
-    return cv2.getPerspectiveTransform(image_points, table_points)
+    return load_calibration(path).H_inv
 
 
 def project_to_table(point_xy, homography):
@@ -117,6 +95,9 @@ def inference_video(
     vis_traj_path=None,
     dist_thresh=10.0,
     existing_traj_path=None,
+    traj_output_path=None,
+    output_video_path=None,
+    preloaded_speed_homography=None,
 ):
     t_start = time.time()
     num_frames = 0
@@ -203,15 +184,16 @@ def inference_video(
     direction_smoothing_alpha = float(vis_cfg.get("direction_smoothing_alpha", 0.35))
     hud_position = vis_cfg.get("hud_position", "top_center")
 
-    speed_homography = None
+    speed_homography = preloaded_speed_homography
     motion_estimator = None
     if show_speed_direction:
         if not calibration_file:
             print("Calibration not provided; speed/direction calculation is disabled")
             show_speed_direction = False
         else:
-            speed_homography = load_speed_calibration(calibration_file)
-            print("Loaded PongEye calibration from " + str(calibration_file))
+            if speed_homography is None:
+                speed_homography = load_speed_calibration(calibration_file)
+                print("Loaded PongEye calibration from " + str(calibration_file))
             motion_estimator = MotionEstimator(
                 fps=fps,
                 speed_window_frames=speed_window,
@@ -310,7 +292,7 @@ def inference_video(
                     cv2.imwrite(hm_path, vis_hm_pred)
 
     if vis_frame_dir is not None:
-        video_path = "{}.mp4".format(vis_frame_dir)
+        video_path = output_video_path or "{}.mp4".format(vis_frame_dir)
         gen_video(video_path, vis_frame_dir, fps=fps)
         print("Saving video at " + video_path)
 
@@ -329,10 +311,152 @@ def inference_video(
         else:
             df = pd.DataFrame({"Frame": x_fin, "X": x_fin, "Y": y_fin, "Visibility": vis_fin})
         df["Frame"] = df.index
-        df.to_csv(osp.join(frame_dir, "traj.csv"), index=False)
-        print("Saving csv at " + osp.join(frame_dir, "traj.csv"))
+        csv_path = str(traj_output_path or (Path(frame_dir) / "traj.csv"))
+        df.to_csv(csv_path, index=False)
+        print("Saving csv at " + csv_path)
 
     return {"t_elapsed": t_elapsed, "num_frames": num_frames}
+
+
+class VideoInferenceProcessor:
+    """Run the existing detector/tracker pipeline for one independent video.
+
+    All folders used for a recording run are supplied by the caller, allowing
+    the folder runner to use a temporary workspace rather than polluting the
+    source recording with extracted PNGs.
+    """
+
+    def __init__(self, cfg, model=None, preloaded_speed_homography=None):
+        self.cfg = cfg
+        self.model = model
+        self.preloaded_speed_homography = preloaded_speed_homography
+        # The detector has no trajectory state, so it can be shared across
+        # segments.  Building it here also makes model/configuration failures
+        # fail the recording once, rather than once per segment.
+        self.detector = build_detector(self.cfg, model=self.model)
+
+    def process(self, input_video_path, csv_path, mode, annotated_video_path=None,
+                keep_extracted_frames=False, persistent_frame_dir=None,
+                include_heatmaps=False):
+        input_video_path = Path(input_video_path)
+        csv_path = Path(csv_path)
+        csv_path.parent.mkdir(parents=True, exist_ok=True)
+        if mode not in {"standard", "trajectory_only", "csv_only"}:
+            raise ValueError(f"Unsupported mode: {mode!r}")
+
+        with tempfile.TemporaryDirectory(prefix=f"blurball_{input_video_path.stem}_") as workspace:
+            workspace = Path(workspace)
+            frame_dir = Path(persistent_frame_dir) if persistent_frame_dir else workspace / "frames"
+            frame_pngs = list(frame_dir.glob("*.png")) if frame_dir.is_dir() else []
+            if not frame_pngs:
+                process_video(input_video_path, output_dir=str(frame_dir))
+            else:
+                print(f"Reusing extracted frames: {frame_dir} ({len(frame_pngs)} PNGs)")
+
+            # A fresh tracker is deliberately constructed for every segment.
+            tracker = build_tracker(self.cfg)
+
+            vis_frame_dir = None
+            vis_hm_dir = None
+            if mode == "standard":
+                if annotated_video_path is None:
+                    raise ValueError("standard mode requires an annotated output video path")
+                vis_frame_dir = str(workspace / "annotated_frames")
+                mkdir_if_missing(vis_frame_dir)
+                if include_heatmaps:
+                    vis_hm_dir = str(workspace / "heatmaps")
+                    mkdir_if_missing(vis_hm_dir)
+
+            result = inference_video(
+                self.detector, tracker, input_video_path, frame_dir, self.cfg,
+                vis_frame_dir=vis_frame_dir, vis_hm_dir=vis_hm_dir,
+                traj_output_path=csv_path, output_video_path=str(annotated_video_path)
+                if annotated_video_path else None,
+                preloaded_speed_homography=self.preloaded_speed_homography,
+            )
+
+            # Only explicitly requested single-video debugging frames survive.
+            if persistent_frame_dir and not keep_extracted_frames:
+                shutil.rmtree(frame_dir, ignore_errors=True)
+            return result
+
+
+class RecordingInferenceRunner:
+    """Process a PongEye recording folder segment-by-segment."""
+
+    SUPPORTED_VIDEO_EXTENSIONS = {".mov", ".mp4"}
+
+    def __init__(self, cfg, model=None):
+        self.cfg = cfg
+        self.model = model
+        self.recording_dir = Path(cfg["input_folder"])
+        self.mode = str(cfg["runner"].get("mode", "standard"))
+        self.overwrite = bool(cfg.get("overwrite", False))
+        if self.mode not in {"standard", "csv_only", "trajectory_only"}:
+            raise ValueError("Folder mode supports 'standard' or 'csv_only'")
+        if self.mode == "trajectory_only":
+            self.mode = "csv_only"
+
+    @classmethod
+    def discover_segments(cls, recording_dir):
+        segments_dir = Path(recording_dir) / "segments"
+        if not segments_dir.is_dir():
+            raise ValueError(f"Segments directory not found: {segments_dir}")
+        return sorted(
+            (path for path in segments_dir.iterdir()
+             if path.is_file() and path.suffix.lower() in cls.SUPPORTED_VIDEO_EXTENSIONS),
+            key=lambda path: path.name.lower(),
+        )
+
+    def run(self):
+        if not self.recording_dir.is_dir():
+            raise ValueError(f"Recording folder not found: {self.recording_dir}")
+        segments = self.discover_segments(self.recording_dir)
+        if not segments:
+            raise ValueError(f"No supported videos found in {self.recording_dir / 'segments'}")
+
+        calibration_path = self.recording_dir / "calibration.json"
+        show_metrics = bool(self.cfg.get("runner", {}).get("visualization", {}).get("show_speed_direction", False))
+        homography = None
+        if show_metrics:
+            if not calibration_path.is_file():
+                raise ValueError(f"Calibration file not found: {calibration_path}")
+            homography = load_speed_calibration(calibration_path)
+            self.cfg["calibration_file"] = str(calibration_path)
+            print(f"Loaded recording calibration once: {calibration_path}")
+
+        output_dir = self.recording_dir / "blurBall"
+        output_dir.mkdir(exist_ok=True)
+        annotated_dir = output_dir / "segments"
+        if self.mode == "standard":
+            annotated_dir.mkdir(exist_ok=True)
+
+        processor = VideoInferenceProcessor(self.cfg, self.model, homography)
+        processed = skipped = 0
+        failures = []
+        for index, segment in enumerate(segments, start=1):
+            csv_path = output_dir / f"{segment.stem}.csv"
+            video_path = annotated_dir / segment.name
+            complete = csv_path.is_file() and (self.mode == "csv_only" or video_path.is_file())
+            if complete and not self.overwrite:
+                skipped += 1
+                print(f"[{index}/{len(segments)}] Skipping {segment.name}; outputs already exist")
+                continue
+            print(f"[{index}/{len(segments)}] Processing {segment.name}")
+            try:
+                processor.process(
+                    segment, csv_path, self.mode,
+                    annotated_video_path=video_path if self.mode == "standard" else None,
+                )
+                processed += 1
+            except Exception as exc:
+                failures.append((segment.name, str(exc)))
+                print(f"[{index}/{len(segments)}] Failed {segment.name}: {exc}")
+
+        print(f"Processed: {processed}\nSkipped:   {skipped}\nFailed:    {len(failures)}")
+        for name, reason in failures:
+            print(f"  {name}: {reason}")
+        return {"processed": processed, "skipped": skipped, "failures": failures}
 
 
 class NewVideosInferenceRunner(BaseRunner):
@@ -344,7 +468,7 @@ class NewVideosInferenceRunner(BaseRunner):
         self._vis_result = bool(runner_cfg.get("vis_result", True))
         self._vis_hm = bool(runner_cfg.get("vis_hm", True))
         self._vis_traj = bool(runner_cfg.get("vis_traj", False))
-        self._input_vid_path = Path(cfg["input_vid"])
+        self._input_vid_path = Path(cfg["input_vid"]) if cfg.get("input_vid") else None
 
         if self._mode not in {"standard", "trajectory_only"}:
             raise ValueError(
@@ -368,6 +492,9 @@ class NewVideosInferenceRunner(BaseRunner):
             self._cfg["runner"]["device"] = "cuda"
             print("CUDA is not available; BlurBall requires an NVIDIA CUDA GPU")
 
+        if self._input_vid_path is None:
+            raise ValueError("input_vid is required when input_folder is not provided")
+        # Preserve the established single-video artifact layout and behavior.
         frame_dir = self._input_vid_path.parent / ("frames_" + self._input_vid_path.stem)
         frame_pngs = list(frame_dir.glob("*.png")) if frame_dir.is_dir() else []
         extracted_here = False

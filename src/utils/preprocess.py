@@ -11,13 +11,14 @@ from skimage.metrics import structural_similarity as ssim
 SSIM_THRESHOLD = 0.99  # SSIM threshold for detecting similar frames (1.0 is identical)
 
 
-def process_video(video_path, filter=False):
+def process_video(video_path, filter=False, output_dir=None):
     video_path = os.path.abspath(video_path)
     video_dir = os.path.dirname(video_path)
     video_name, _ = os.path.splitext(os.path.basename(video_path))
 
-    # Output directory relative to the video file
-    frames_dir = os.path.join(video_dir, "frames_" + video_name)
+    # The historical default keeps frames next to the source video.  Callers
+    # processing a recording folder can instead provide a temporary location.
+    frames_dir = output_dir or os.path.join(video_dir, "frames_" + video_name)
     os.makedirs(frames_dir, exist_ok=True)
 
     # Open the video file

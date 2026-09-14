@@ -114,6 +114,34 @@ examples/pongeye_calibration.json
 
 The visualization displays the detected ball, a continuously rotating direction arrow, and the current calibrated table-plane speed in km/h in the upper-center HUD. Speed is calculated using the source video's FPS and the image-to-table homography derived from the calibration corners.
 
+### PongEye recording folders
+
+To process a PongEye recording containing `segments/*.mov` or `segments/*.mp4`, pass
+the recording directory rather than an individual video:
+
+```
+python src/main.py --config-name=inference_blurball \
+  detector.model_path=<path_to_blurball> \
+  input_folder=/path/to/recording
+```
+
+This writes one CSV per segment to `blurBall/segment_XXX.csv` and, in the default
+`standard` mode, annotated videos to `blurBall/segments/segment_XXX.mov`. Segments
+are sorted by filename and are independently tracked. `calibration.json` is loaded
+once from the recording directory when the speed/direction HUD is enabled.
+
+For trajectory CSVs only (no annotated video and no persistent extracted PNGs):
+
+```
+python src/main.py --config-name=inference_blurball \
+  detector.model_path=<path_to_blurball> \
+  input_folder=/path/to/recording \
+  runner.mode=csv_only
+```
+
+Existing complete outputs are skipped by default. Regenerate them with
+`overwrite=true`.
+
 ### BlurBall parameters
 - Step size: trade off between accuracy and speed
 - Score threshold: recommended 0.7 for 1-step inference
