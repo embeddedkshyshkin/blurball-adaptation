@@ -11,7 +11,8 @@ eval:
   score_threshold: 0.5
 visualization:
   show_speed_direction: True
-  # Speed benefits from a longer local fit; direction must stay responsive.
+  # Primary speed/direction path: reconstruct airborne motion in 3-D from
+  # camera pose + gravity, then differentiate a local polynomial fit.
   speed_window_frames: 9
   direction_window_frames: 5
   speed_smoothing_alpha: 0.35
@@ -20,4 +21,16 @@ visualization:
   direction_min_speed_kmh: 3.0
   reversal_confirm_frames: 2
   direction_smoothing_alpha: 1.0
+
+  # Physical 3-D kinematics.
+  kinematics_min_track: 12
+  kinematics_max_gap: 3
+  kinematics_max_px_step: 140
+  kinematics_max_px_accel: 45
+  kinematics_polynomial_degree: 2
+  kinematics_plane_margin_m: 1.0
+  kinematics_max_fit_rms_m: 0.25
+  kinematics_max_reproj_px: 8.0
+  kinematics_gravity_weight: 3.0
+
   hud_position: top_center
