@@ -66,6 +66,13 @@ EXTENDED_COLUMNS = [
 
 HIST_LEN = 8
 MAX_PROPAGATE_GAP_FRAMES = 90  # ~1.5s at 60fps before a held depth is distrusted
+# Hard ceiling on the *reported* speed -- defense in depth, independent of
+# the KF's own accel/velocity decay (ball_tracker_kf.py). No detector- or
+# fit-internal failure should ever reach a CSV consumer or the HUD as a
+# physically impossible number: found empirically on segment_001, where a
+# long predict-only KF coast (now damped, but this stays as a floor) reached
+# five-figure SpeedKmh. 150 km/h is well above any real table-tennis shot.
+MAX_PLAUSIBLE_SPEED_KMH = 150.0
 
 
 def _load_calibration(recording_dir: Path, fps_hint: float):
@@ -110,15 +117,22 @@ def process_segment(recording_dir: Path, segment: str, render_video: bool,
     cal = _load_calibration(recording_dir, fps_hint)
     fps = cal.fps if cal is not None else fps_hint
 
-    kf = BallKalmanTracker2D(dt=1.0 / fps)
+    if cap is not None:
+        frame_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)) or 1920
+        frame_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)) or 1080
+    else:
+        # No .mov on disk (e.g. CSV-only testing): fall back to this
+        # recording's known resolution. Only used for the KF's off-frame
+        # divergence gate, so an approximate value here is fine.
+        frame_w, frame_h = 1920, 1080
+    kf = BallKalmanTracker2D(dt=1.0 / fps, frame_width=frame_w, frame_height=frame_h)
 
     writer = None
     if render_video and cap is not None:
         seg_dir = out_dir / "segments"
         seg_dir.mkdir(exist_ok=True)
         video_out = seg_dir / f"{segment}.mp4"
-        w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        w, h = frame_w, frame_h
         fourcc = cv2.VideoWriter_fourcc(*"mp4v")
         writer = cv2.VideoWriter(str(video_out), fourcc, fps, (w, h))
         log.info("Rendering annotated video to %s", video_out)
@@ -213,6 +227,32 @@ def process_segment(recording_dir: Path, segment: str, render_video: bool,
                 # ts.vx/vy (and hence img_speed_px) are already px/second: the
                 # KF's dt is real seconds, not frames. No extra *fps here.
                 speed_kmh = float(img_speed_px * z_hat / fx * 3.6)
+
+            if abs(speed_kmh) > MAX_PLAUSIBLE_SPEED_KMH:
+                # abs(), not >: a diverged/near-parallel-to-table-plane ray
+                # in the propagated/default fallback (table_depth_at can
+                # return a negative depth for a pixel whose ray barely
+                # grazes or misses the table plane) produces a negative
+                # z_hat and hence a negative speed_kmh -- equally bogus and
+                # equally worth suppressing.
+                # A KF or fit failure, not a fast ball -- see the constant's
+                # comment. Report a track without a trustworthy speed rather
+                # than a number nobody should act on.
+                if scale_source in ("bounce", "curvature"):
+                    # This path already passed fit.plausible() (reprojection
+                    # RMS + physical accel gates) at line ~198. Getting here
+                    # anyway means a gate gap, not a known KF-coast failure
+                    # mode -- worth a log line rather than only silent
+                    # suppression, since silently zeroing it would hide a
+                    # bug in the plausibility gates themselves.
+                    log.warning("frame %d: %s fit passed plausibility gates "
+                                "but yielded %.1f km/h (> %.0f); clamped to 0",
+                                i, scale_source, speed_kmh, MAX_PLAUSIBLE_SPEED_KMH)
+                speed_kmh = 0.0
+                confidence = 0.0
+                world = vel = None
+                table_heading = None
+                scale_source = "none"
 
         rows.append({
             "Frame": i, "X": r["X"], "Y": r["Y"], "Visibility": r["Visibility"],

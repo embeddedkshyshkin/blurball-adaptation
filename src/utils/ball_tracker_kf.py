@@ -50,6 +50,42 @@ _DEFAULT_JERK_STD = 150_000.0
 # Measurement noise: 1-sigma pixel localisation error of the detector.
 _DEFAULT_MEAS_STD = 2.0
 
+# Per-predict-step decay applied to the acceleration point estimate (not its
+# covariance, which already grows correctly). See the comment on
+# _AxisKF.predict for why this exists: a long run of predict-only steps
+# integrating a constant, un-decaying acceleration is quadratically unstable.
+# 0.90 kills a runaway acceleration to ~12% within 20 steps, after which a
+# coast is bounded (linear in the surviving velocity, not quadratic) and
+# max_gap_frames caps how long it can run at all.
+#
+# Velocity is deliberately NOT decayed the same way. A Kalman update only
+# undoes a bias by (gain x innovation); in steady, well-tracked motion the
+# velocity gain is small (P has converged near the measurement-noise floor),
+# so a per-frame velocity haircut is not "corrected each frame" the way the
+# acceleration one effectively is -- it would instead read as a persistent
+# few-percent low bias in SpeedKmh across the whole clip. Acceleration decay
+# alone already removes the instability; adding velocity decay bought
+# boundedness the gap length already provides, at the cost of a real bias.
+_ACCEL_DECAY_PER_STEP = 0.90
+
+# The accel decay above bounds a coast from quadratic to linear growth, but
+# "linear" over up to max_gap_frames steps is still not "small": measured on
+# segment_000 (a segment already validated on every OTHER metric -- direction
+# accuracy, retention, bounce count) after adding the decay, 610 rows still
+# carried |Xf| or |Yf| beyond 3000px, some past 20000px, all on Source =
+# "predicted" gap frames following a bounce inflate(). The mechanism: inflate()
+# widens the acceleration/velocity covariance right when a gap is about to
+# start, so if the gap begins immediately after, the filter free-runs from an
+# already-large velocity/acceleration estimate for up to max_gap_frames steps.
+# The resulting SpeedKmh values (as low as ~95-150 km/h on this data) are not
+# reliably caught by enrich_and_render.py's MAX_PLAUSIBLE_SPEED_KMH clamp,
+# since the decayed velocity can sit just under that threshold even while the
+# position it came from is many frames' worth of real motion outside the
+# frame -- a bounds check on position is the direct fix, independent of
+# whatever the derived speed happens to compute to. 500px is generous enough
+# that a ball genuinely leaving frame near an edge is not penalised.
+_BOUNDS_MARGIN_PX = 500.0
+
 
 def _cv_matrices(dt: float, jerk_std: float, meas_std: float):
     """Constant-acceleration transition/noise matrices for one scalar axis."""
@@ -81,6 +117,21 @@ class _AxisKF:
     initialised: bool = False
 
     def predict(self):
+        # Decay acceleration slightly on every predict, not just during a
+        # gap. A constant-acceleration model integrated blindly for many
+        # consecutive predict-only steps (a real gap) is quadratically
+        # unstable: found empirically as Xf/Yf reaching +-10000+ px and
+        # SpeedKmh reaching 5 figures on segment_001, always on a long
+        # predict-only run where the last fitted acceleration (often
+        # widened right after `inflate()`) got integrated unchecked. Decaying
+        # the ACCELERATION state (not the covariance -- that already grows
+        # correctly) means a long coast degrades toward constant *velocity*
+        # (bounded, since max_gap_frames caps how long it can run) rather
+        # than diverging. On a normally-tracked frame the very next
+        # measurement update re-corrects it, so this decay is a no-op in
+        # effect there; it only bites over a genuine multi-frame gap.
+        # Velocity is NOT decayed here -- see the constant's comment.
+        self.x[2] *= _ACCEL_DECAY_PER_STEP
         self.x = self.F @ self.x
         self.P = self.F @ self.P @ self.F.T + self.Q
 
@@ -136,7 +187,9 @@ class BallKalmanTracker2D:
     def __init__(self, dt: float, max_gap_frames: int = 20,
                  jerk_std: float = _DEFAULT_JERK_STD,
                  meas_std: float = _DEFAULT_MEAS_STD,
-                 gate_chi2: float = _GATE_CHI2):
+                 gate_chi2: float = _GATE_CHI2,
+                 frame_width: float = 1920.0, frame_height: float = 1080.0,
+                 bounds_margin_px: float = _BOUNDS_MARGIN_PX):
         F, Q, H, R = _cv_matrices(dt, jerk_std, meas_std)
         self._kx = _AxisKF(F, Q, H, R)
         self._ky = _AxisKF(F, Q, H, R)
@@ -145,6 +198,10 @@ class BallKalmanTracker2D:
         self._frames_since_update = 10 ** 9
         self._track_id = 0
         self._track_age = 0
+        self._x_lo = -bounds_margin_px
+        self._x_hi = frame_width + bounds_margin_px
+        self._y_lo = -bounds_margin_px
+        self._y_hi = frame_height + bounds_margin_px
 
     @property
     def alive(self) -> bool:
@@ -172,6 +229,16 @@ class BallKalmanTracker2D:
         self._kx.predict()
         self._ky.predict()
         self._track_age += 1
+
+        if not (self._x_lo <= self._kx.x[0] <= self._x_hi
+                and self._y_lo <= self._ky.x[0] <= self._y_hi):
+            # Predicted position has left the frame by more than the margin:
+            # a diverged track (see _BOUNDS_MARGIN_PX), not a tracked ball.
+            # Kill it the same way an exhausted gap does, so a fresh
+            # measurement (this frame or later) starts a clean track instead
+            # of this one continuing to report garbage as "predicted".
+            self._kx.initialised = False
+            return self.step(frame, meas_xy)
 
         source = "predicted"
         if meas_xy is not None:
