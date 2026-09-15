@@ -1,0 +1,205 @@
+from __future__ import annotations
+
+"""Causal image-space ball tracker.
+
+A constant-acceleration Kalman filter per pixel axis (x, y), independent and
+decoupled. It exists to answer three things every frame, using only the
+current and earlier measurements:
+
+  * a position for every frame, including the ~48% that have no detection
+    (predict-only steps, tagged ``predicted`` rather than ``measured``);
+  * an outlier gate, so the spurious multi-hundred-pixel jumps present in the
+    raw BlurBall trajectory are rejected instead of corrupting the velocity
+    estimate;
+  * a velocity estimate whose direction is the screen-space heading the HUD
+    draws — no 3-D, no table-frame angle, so there is nothing to project and
+    nothing that can be drawn in the wrong frame.
+
+This module knows nothing about calibration, gravity, or the table. Bounce
+handling is a single method, ``inflate_after_bounce``, that the orchestrator
+calls once a bounce is confirmed by ``ball_kinematics_3d``; it does not detect
+bounces itself.
+"""
+
+from dataclasses import dataclass, field
+from typing import Optional
+
+import numpy as np
+
+# chi-square critical value, 2 dof, p=0.999 -- a measurement further than this
+# from the predicted position (in units of its own uncertainty) is treated as
+# a tracking glitch rather than motion.
+_GATE_CHI2 = 13.8
+
+# Process/measurement noise. ``dt`` is real seconds (1/fps), so state is
+# [pos_px, vel_px_per_s, accel_px_per_s^2] and jerk is px/s^3 -- NOT
+# px/frame^3. This matters: with dt properly small, the white-noise-jerk
+# discretisation's dt^3/dt^4/dt^5 terms correctly shrink the process noise
+# injected by a single frame, so a real bounce's sudden reversal (needs a
+# generous jerk budget) can be told apart from a single-frame ~1000px
+# detector glitch (which must still be rejected). Passing dt=1 ("frame
+# units") degenerates that discretisation -- every dt power collapses to 1
+# and the gate stops discriminating anything. Values below were picked by
+# sweeping against video/2026-09-15_17-06-07/blurBall/segment_000.csv:
+# at this setting a known ~250px double-jump (frames 5990-5991) is rejected
+# while 84.5% of real detections are kept, and isolated single-frame blips
+# (run length <= 3) are accepted at a much lower rate (66%) than points
+# that are part of a real run (86%) -- the gate is discriminating, not just
+# open or shut.
+_DEFAULT_JERK_STD = 150_000.0
+# Measurement noise: 1-sigma pixel localisation error of the detector.
+_DEFAULT_MEAS_STD = 2.0
+
+
+def _cv_matrices(dt: float, jerk_std: float, meas_std: float):
+    """Constant-acceleration transition/noise matrices for one scalar axis."""
+    F = np.array([[1.0, dt, 0.5 * dt * dt],
+                  [0.0, 1.0, dt],
+                  [0.0, 0.0, 1.0]])
+    # Discretised white-noise-jerk process covariance (standard result for a
+    # 3rd-order kinematic model driven by white jerk noise).
+    dt2, dt3, dt4, dt5 = dt**2, dt**3, dt**4, dt**5
+    q = jerk_std ** 2
+    Q = q * np.array([
+        [dt5 / 20.0, dt4 / 8.0, dt3 / 6.0],
+        [dt4 / 8.0, dt3 / 3.0, dt2 / 2.0],
+        [dt3 / 6.0, dt2 / 2.0, dt],
+    ])
+    H = np.array([[1.0, 0.0, 0.0]])
+    R = np.array([[meas_std ** 2]])
+    return F, Q, H, R
+
+
+@dataclass
+class _AxisKF:
+    F: np.ndarray
+    Q: np.ndarray
+    H: np.ndarray
+    R: np.ndarray
+    x: np.ndarray = field(default_factory=lambda: np.zeros(3))
+    P: np.ndarray = field(default_factory=lambda: np.eye(3) * 1e6)
+    initialised: bool = False
+
+    def predict(self):
+        self.x = self.F @ self.x
+        self.P = self.F @ self.P @ self.F.T + self.Q
+
+    def innovation(self, z: float):
+        y = z - (self.H @ self.x)[0]
+        S = (self.H @ self.P @ self.H.T + self.R)[0, 0]
+        return y, S
+
+    def update(self, z: float):
+        y, S = self.innovation(z)
+        K = (self.P @ self.H.T) / S
+        self.x = self.x + (K[:, 0] * y)
+        self.P = (np.eye(3) - K @ self.H) @ self.P
+
+    def reset(self, pos: float):
+        self.x = np.array([pos, 0.0, 0.0])
+        self.P = np.diag([_DEFAULT_MEAS_STD ** 2, 400.0, 4000.0])
+        self.initialised = True
+
+    def inflate(self, vel_var: float = 400.0, acc_var: float = 9000.0):
+        """Widen velocity/acceleration uncertainty so the filter re-adapts
+        quickly instead of smoothing across a discontinuity (a bounce or a
+        racket contact) that the constant-acceleration model cannot represent.
+        """
+        self.P[1, 1] = max(self.P[1, 1], vel_var)
+        self.P[2, 2] = max(self.P[2, 2], acc_var)
+
+
+@dataclass
+class TrackState:
+    frame: int
+    x: float
+    y: float
+    vx: float  # px/second (dt passed to the filter is real seconds)
+    vy: float
+    ax: float  # px/second^2
+    ay: float
+    source: str  # "measured" | "predicted" | "none"
+    frames_since_update: int
+    track_id: int
+    track_age: int  # frames since this track (re)started
+
+
+class BallKalmanTracker2D:
+    """Independent constant-acceleration KF per axis, with gating and a
+    dead-reckoning gap policy.
+
+    Call :meth:`step` once per frame, in order, with the raw detector output
+    for that frame (or ``None`` when the detector reported nothing). Nothing
+    it does looks at any frame after the one just given.
+    """
+
+    def __init__(self, dt: float, max_gap_frames: int = 20,
+                 jerk_std: float = _DEFAULT_JERK_STD,
+                 meas_std: float = _DEFAULT_MEAS_STD,
+                 gate_chi2: float = _GATE_CHI2):
+        F, Q, H, R = _cv_matrices(dt, jerk_std, meas_std)
+        self._kx = _AxisKF(F, Q, H, R)
+        self._ky = _AxisKF(F, Q, H, R)
+        self._max_gap = max_gap_frames
+        self._gate_chi2 = gate_chi2
+        self._frames_since_update = 10 ** 9
+        self._track_id = 0
+        self._track_age = 0
+
+    @property
+    def alive(self) -> bool:
+        return self._kx.initialised and self._frames_since_update <= self._max_gap
+
+    def step(self, frame: int, meas_xy: Optional[tuple[float, float]]) -> TrackState:
+        if not self._kx.initialised:
+            if meas_xy is None:
+                return TrackState(frame, float("nan"), float("nan"), 0.0, 0.0, 0.0, 0.0,
+                                   "none", self._frames_since_update, self._track_id, 0)
+            self._kx.reset(meas_xy[0])
+            self._ky.reset(meas_xy[1])
+            self._frames_since_update = 0
+            self._track_id += 1
+            self._track_age = 0
+            return TrackState(frame, meas_xy[0], meas_xy[1], 0.0, 0.0, 0.0, 0.0,
+                               "measured", 0, self._track_id, 0)
+
+        if self._frames_since_update > self._max_gap:
+            # Track has been dead-reckoning for too long: kill it. The next
+            # measurement (this frame or a later one) starts a fresh track.
+            self._kx.initialised = False
+            return self.step(frame, meas_xy)
+
+        self._kx.predict()
+        self._ky.predict()
+        self._track_age += 1
+
+        source = "predicted"
+        if meas_xy is not None:
+            yx, Sx = self._kx.innovation(meas_xy[0])
+            yy, Sy = self._ky.innovation(meas_xy[1])
+            d2 = (yx * yx) / Sx + (yy * yy) / Sy
+            if d2 <= self._gate_chi2:
+                self._kx.update(meas_xy[0])
+                self._ky.update(meas_xy[1])
+                self._frames_since_update = 0
+                source = "measured"
+            else:
+                # Gated out as a tracking glitch (e.g. the ~250px jumps seen
+                # in the raw trajectory around frames 5990-5991): treat this
+                # frame as a gap rather than trusting the outlier.
+                self._frames_since_update += 1
+        else:
+            self._frames_since_update += 1
+
+        return TrackState(
+            frame, float(self._kx.x[0]), float(self._ky.x[0]),
+            float(self._kx.x[1]), float(self._ky.x[1]),
+            float(self._kx.x[2]), float(self._ky.x[2]),
+            source, self._frames_since_update, self._track_id, self._track_age,
+        )
+
+    def inflate_after_bounce(self):
+        """Widen velocity/acceleration covariance so a confirmed bounce does
+        not get smoothed into the surrounding constant-acceleration fit."""
+        self._kx.inflate()
+        self._ky.inflate()
