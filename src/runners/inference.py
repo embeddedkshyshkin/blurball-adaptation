@@ -359,3 +359,331 @@ def inference_video(
         print("Saving csv at " + csv_path)
 
     return {"t_elapsed": t_elapsed, "num_frames": num_frames}
+
+class VideoInferenceProcessor:
+    """Run the existing detector/tracker pipeline for one independent video.
+
+    All folders used for a recording run are supplied by the caller, allowing
+    the folder runner to use a temporary workspace rather than polluting the
+    source recording with extracted PNGs.
+    """
+
+    def __init__(self, cfg, model=None, preloaded_speed_homography=None):
+        self.cfg = cfg
+        self.model = model
+        self.preloaded_speed_homography = preloaded_speed_homography
+        # The detector has no trajectory state, so it can be shared across
+        # segments.  Building it here also makes model/configuration failures
+        # fail the recording once, rather than once per segment.
+        self.detector = build_detector(self.cfg, model=self.model)
+
+    def process(self, input_video_path, csv_path, mode, annotated_video_path=None,
+                keep_extracted_frames=False, persistent_frame_dir=None,
+                include_heatmaps=False):
+        input_video_path = Path(input_video_path)
+        csv_path = Path(csv_path)
+        csv_path.parent.mkdir(parents=True, exist_ok=True)
+        if mode not in {"standard", "trajectory_only", "csv_only"}:
+            raise ValueError(f"Unsupported mode: {mode!r}")
+
+        with tempfile.TemporaryDirectory(prefix=f"blurball_{input_video_path.stem}_") as workspace:
+            workspace = Path(workspace)
+            frame_dir = Path(persistent_frame_dir) if persistent_frame_dir else workspace / "frames"
+            frame_pngs = list(frame_dir.glob("*.png")) if frame_dir.is_dir() else []
+            if not frame_pngs:
+                process_video(input_video_path, output_dir=str(frame_dir))
+            else:
+                print(f"Reusing extracted frames: {frame_dir} ({len(frame_pngs)} PNGs)")
+
+            # A fresh tracker is deliberately constructed for every segment.
+            tracker = build_tracker(self.cfg)
+
+            vis_frame_dir = None
+            vis_hm_dir = None
+            if mode == "standard":
+                if annotated_video_path is None:
+                    raise ValueError("standard mode requires an annotated output video path")
+                vis_frame_dir = str(workspace / "annotated_frames")
+                mkdir_if_missing(vis_frame_dir)
+                if include_heatmaps:
+                    vis_hm_dir = str(workspace / "heatmaps")
+                    mkdir_if_missing(vis_hm_dir)
+
+            result = inference_video(
+                self.detector, tracker, input_video_path, frame_dir, self.cfg,
+                vis_frame_dir=vis_frame_dir, vis_hm_dir=vis_hm_dir,
+                traj_output_path=csv_path, output_video_path=str(annotated_video_path)
+                if annotated_video_path else None,
+                preloaded_speed_homography=self.preloaded_speed_homography,
+            )
+
+            # Only explicitly requested single-video debugging frames survive.
+            if persistent_frame_dir and not keep_extracted_frames:
+                shutil.rmtree(frame_dir, ignore_errors=True)
+            return result
+
+
+def _process_segment_worker(args):
+    """Top-level worker for ProcessPoolExecutor (must be picklable).
+
+    Each worker loads its own detector on the GPU. Keep
+    ``runner.num_parallel_segments`` modest (typically 1-2 on a single GPU)
+    to avoid VRAM exhaustion.
+    """
+    (
+        segment_path,
+        csv_path,
+        mode,
+        annotated_video_path,
+        cfg_container,
+        calibration_file,
+        index,
+        total,
+    ) = args
+
+    # Reconstruct a DictConfig so downstream code keeps working unchanged.
+    cfg = OmegaConf.create(cfg_container)
+    if calibration_file:
+        cfg["calibration_file"] = calibration_file
+
+    # Ensure CUDA is selected inside the child process.
+    if torch.cuda.is_available():
+        cfg["runner"]["device"] = "cuda"
+        cfg["runner"]["gpus"] = [0]
+
+    print(f"[{index}/{total}] [worker] Processing {Path(segment_path).name}")
+    try:
+        # Load model path from detector config if present; otherwise build_detector
+        # will use whatever is already configured.
+        processor = VideoInferenceProcessor(cfg, model=None, preloaded_speed_homography=None)
+        processor.process(
+            segment_path,
+            csv_path,
+            mode,
+            annotated_video_path=annotated_video_path,
+        )
+        return {"status": "ok", "name": Path(segment_path).name, "index": index}
+    except Exception as exc:
+        return {
+            "status": "error",
+            "name": Path(segment_path).name,
+            "index": index,
+            "error": str(exc),
+        }
+
+
+class RecordingInferenceRunner:
+    """Process a PongEye recording folder segment-by-segment."""
+
+    SUPPORTED_VIDEO_EXTENSIONS = {".mov", ".mp4"}
+
+    def __init__(self, cfg, model=None):
+        self.cfg = cfg
+        self.model = model
+        self.recording_dir = Path(cfg["input_folder"])
+        self.mode = str(cfg["runner"].get("mode", "standard"))
+        self.overwrite = bool(cfg.get("overwrite", False))
+        # Parallel segment processing (ProcessPoolExecutor). Default 1 = sequential.
+        self.num_parallel = int(cfg["runner"].get("num_parallel_segments", 1))
+        if self.num_parallel < 1:
+            raise ValueError("runner.num_parallel_segments must be >= 1")
+        if self.mode not in {"standard", "csv_only", "trajectory_only"}:
+            raise ValueError("Folder mode supports 'standard' or 'csv_only'")
+        if self.mode == "trajectory_only":
+            self.mode = "csv_only"
+
+    @classmethod
+    def discover_segments(cls, recording_dir):
+        segments_dir = Path(recording_dir) / "segments"
+        if not segments_dir.is_dir():
+            raise ValueError(f"Segments directory not found: {segments_dir}")
+        return sorted(
+            (path for path in segments_dir.iterdir()
+             if path.is_file() and path.suffix.lower() in cls.SUPPORTED_VIDEO_EXTENSIONS),
+            key=lambda path: path.name.lower(),
+        )
+
+    def run(self):
+        if not self.recording_dir.is_dir():
+            raise ValueError(f"Recording folder not found: {self.recording_dir}")
+        segments = self.discover_segments(self.recording_dir)
+        if not segments:
+            raise ValueError(f"No supported videos found in {self.recording_dir / 'segments'}")
+
+        calibration_path = self.recording_dir / "calibration.json"
+        show_metrics = bool(self.cfg.get("runner", {}).get("visualization", {}).get("show_speed_direction", False))
+        homography = None
+        calibration_file = None
+        if show_metrics:
+            if not calibration_path.is_file():
+                raise ValueError(f"Calibration file not found: {calibration_path}")
+            homography = load_speed_calibration(calibration_path)
+            calibration_file = str(calibration_path)
+            self.cfg["calibration_file"] = calibration_file
+            print(f"Loaded recording calibration once: {calibration_path}")
+
+        output_dir = self.recording_dir / "blurBall"
+        output_dir.mkdir(exist_ok=True)
+        annotated_dir = output_dir / "segments"
+        if self.mode == "standard":
+            annotated_dir.mkdir(exist_ok=True)
+
+        # Build the work list (skip already-complete segments).
+        work_items = []
+        skipped = 0
+        for index, segment in enumerate(segments, start=1):
+            csv_path = output_dir / f"{segment.stem}.csv"
+            video_path = annotated_dir / segment.name
+            complete = csv_path.is_file() and (self.mode == "csv_only" or video_path.is_file())
+            if complete and not self.overwrite:
+                skipped += 1
+                print(f"[{index}/{len(segments)}] Skipping {segment.name}; outputs already exist")
+                continue
+            work_items.append(
+                (
+                    str(segment),
+                    str(csv_path),
+                    self.mode,
+                    str(video_path) if self.mode == "standard" else None,
+                    OmegaConf.to_container(self.cfg, resolve=True),
+                    calibration_file,
+                    index,
+                    len(segments),
+                )
+            )
+
+        processed = 0
+        failures = []
+
+        if self.num_parallel <= 1 or len(work_items) <= 1:
+            # Sequential path (original behaviour, shares one detector).
+            processor = VideoInferenceProcessor(self.cfg, self.model, homography)
+            for item in work_items:
+                segment_path, csv_path, mode, annotated_video_path, _, _, index, total = item
+                print(f"[{index}/{total}] Processing {Path(segment_path).name}")
+                try:
+                    processor.process(
+                        segment_path, csv_path, mode,
+                        annotated_video_path=annotated_video_path,
+                    )
+                    processed += 1
+                except Exception as exc:
+                    failures.append((Path(segment_path).name, str(exc)))
+                    print(f"[{index}/{total}] Failed {Path(segment_path).name}: {exc}")
+        else:
+            # Parallel path: each worker loads its own model copy.
+            print(
+                f"Processing {len(work_items)} segments with "
+                f"{self.num_parallel} parallel workers (ProcessPoolExecutor). "
+                f"Each worker loads a full model – watch GPU memory."
+            )
+            # "spawn" is required for CUDA + multiprocessing.
+            ctx = torch.multiprocessing.get_context("spawn")
+            with ProcessPoolExecutor(max_workers=self.num_parallel, mp_context=ctx) as executor:
+                futures = {executor.submit(_process_segment_worker, item): item for item in work_items}
+                for future in as_completed(futures):
+                    result = future.result()
+                    if result["status"] == "ok":
+                        processed += 1
+                        print(f"[{result['index']}/{len(segments)}] Finished {result['name']}")
+                    else:
+                        failures.append((result["name"], result["error"]))
+                        print(f"[{result['index']}/{len(segments)}] Failed {result['name']}: {result['error']}")
+
+        print(f"Processed: {processed}\nSkipped:   {skipped}\nFailed:    {len(failures)}")
+        for name, reason in failures:
+            print(f"  {name}: {reason}")
+        return {"processed": processed, "skipped": skipped, "failures": failures}
+
+
+class NewVideosInferenceRunner(BaseRunner):
+    def __init__(self, cfg: DictConfig):
+        super().__init__(cfg)
+        runner_cfg = cfg["runner"]
+        self._mode = str(runner_cfg.get("mode", "standard"))
+        self._keep_extracted_frames = bool(runner_cfg.get("keep_extracted_frames", True))
+        self._vis_result = bool(runner_cfg.get("vis_result", True))
+        self._vis_hm = bool(runner_cfg.get("vis_hm", True))
+        self._vis_traj = bool(runner_cfg.get("vis_traj", False))
+        self._input_vid_path = Path(cfg["input_vid"]) if cfg.get("input_vid") else None
+
+        if self._mode not in {"standard", "trajectory_only"}:
+            raise ValueError(
+                f"Unsupported runner.mode={self._mode!r}; expected 'standard' or 'trajectory_only'"
+            )
+        if self._mode == "trajectory_only":
+            self._vis_result = False
+            self._vis_hm = False
+            self._vis_traj = False
+
+    def run(self, model=None, model_dir=None):
+        return self._run_model(model=model)
+
+    def _run_model(self, model=None):
+        # BlurBall requires CUDA. Select it automatically on machines with an NVIDIA GPU.
+        if torch.cuda.is_available():
+            self._cfg["runner"]["device"] = "cuda"
+            self._cfg["runner"]["gpus"] = [0]
+            print(f"Using CUDA GPU: {torch.cuda.get_device_name(0)}")
+        else:
+            self._cfg["runner"]["device"] = "cuda"
+            print("CUDA is not available; BlurBall requires an NVIDIA CUDA GPU")
+
+        if self._input_vid_path is None:
+            raise ValueError("input_vid is required when input_folder is not provided")
+        # Preserve the established single-video artifact layout and behavior.
+        frame_dir = self._input_vid_path.parent / ("frames_" + self._input_vid_path.stem)
+        frame_pngs = list(frame_dir.glob("*.png")) if frame_dir.is_dir() else []
+        extracted_here = False
+        if frame_pngs:
+            print(f"Reusing extracted frames: {frame_dir} ({len(frame_pngs)} PNGs)")
+        else:
+            frame_dir = Path(process_video(self._input_vid_path))
+            extracted_here = True
+            print("Finished preprocess_video")
+
+        traj_path = frame_dir / "traj.csv"
+        reuse_traj = traj_path.is_file()
+        detector = None
+        tracker = None
+        if reuse_traj:
+            print(f"Reusing existing trajectory: {traj_path}")
+        else:
+            detector = build_detector(self._cfg, model=model)
+            tracker = build_tracker(self._cfg)
+
+        t_elapsed_all = 0.0
+        num_frames_all = 0
+
+        vis_frame_dir, vis_hm_dir, vis_traj_path = None, None, None
+        if self._vis_result:
+            vis_frame_dir = osp.join(self._input_vid_path.parent, "frames")
+            mkdir_if_missing(vis_frame_dir)
+        if self._vis_hm:
+            vis_hm_dir = osp.join(self._input_vid_path.parent, "hm")
+            mkdir_if_missing(vis_hm_dir)
+
+        tmp = inference_video(
+            detector,
+            tracker,
+            self._input_vid_path,
+            frame_dir,
+            self._cfg,
+            vis_frame_dir=vis_frame_dir,
+            vis_hm_dir=vis_hm_dir,
+            existing_traj_path=traj_path if reuse_traj else None,
+        )
+        t_elapsed_all += tmp["t_elapsed"]
+        num_frames_all += tmp["num_frames"]
+
+        if self._mode == "trajectory_only" and extracted_here and not self._keep_extracted_frames:
+            print(f"Removing temporary extracted PNG frames: {frame_dir}")
+            for png_path in frame_dir.glob("*.png"):
+                png_path.unlink()
+            try:
+                frame_dir.rmdir()
+            except OSError:
+                pass
+            print(f"Trajectory retained: {traj_path}")
+
+        return

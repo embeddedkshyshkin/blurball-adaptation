@@ -302,3 +302,108 @@ def fit_arc_causal(cal: Calibration3D, frames: np.ndarray, uv_raw_frame: np.ndar
     pr, _ = cal.project_raw(P)
     rms = float(np.sqrt(np.mean(np.sum((pr - uv) ** 2, axis=1))))
     return FitResult(ok=True, rms_px=rms, P0=P0, V0=V0, a_z=float(a[2]), t0_frame=t0_frame)
+
+
+# --------------------------------------------------------------------------
+# Non-causal per-bounce arc
+# --------------------------------------------------------------------------
+#
+# Everything above is causal. This last section is not, and is kept apart for
+# that reason: it chooses its window by looking at frames the current one has
+# not reached yet.
+#
+# What it is for. The causal reconstruction publishes a world position only
+# once a trailing window of pixels already supports a fit, which on the
+# reference recording is 8% of frames -- and never the opening frames of a
+# flight, because MIN_FIT_WINDOW_ANCHORED of them have to accumulate first.
+# Drawn as they come, those points read as a scatter rather than a ball.
+# Freed from arriving in order, the same fit can start AT a bounce and run
+# forward over pixels that have already been recorded.
+#
+# Why it is anchored to exactly one bounce, and why a bounce-to-bounce fit
+# was tried first and rejected: a single camera cannot resolve the scale of a
+# parabola from pixels alone. Measured over segment_000, an unanchored fit of
+# a bounce-to-bounce window reprojects onto the detections at 1.4-2.4 px
+# while placing the ball three to forty-five metres below the table at 264
+# m/s^2 -- pixel-perfect and physically absurd. The bounce contact pins it,
+# because there and only there the ball's height is known outright.
+#
+# The closing bounce cannot serve as a second anchor: bounce detection needs
+# MIN_BOUNCE_CURVATURE_PX on both sides of an image-v vertex, a flat drive
+# does not clear that bar, and a missed contact makes two flights look like
+# one. Anchoring both ends of that pair fits one parabola to two flights: 5
+# of 51 windows survived the plausibility gates. Growing from one bounce
+# until the pixels stop agreeing instead lets the arc end wherever the ball
+# actually left it -- a racket contact, a missed bounce -- and 34 of 82
+# bounces then yield an arc at 0.87 px median reprojection error.
+#
+# That the gates are doing real work is checkable: vertical acceleration is
+# free over 4.8-14.8 m/s^2 and comes back at 10.1 (quartiles 9.5-10.5)
+# against gravity's 9.81, which no part of this fit was told.
+
+# A guard, not a working limit: the arcs actually grown span a median of 16
+# frames and at most 32. Same-track bounce pairs reach 66 frames at p90, and
+# a 1.1 s ballistic flight peaks 1.5 m above the table -- past the top of a
+# defensive lob, so nothing beyond it is one flight.
+MAX_ARC_SPAN_SEC = 1.1
+
+
+@dataclass
+class BounceArc:
+    """One gravity arc, anchored at a bounce and valid over [first, last]."""
+
+    fit: FitResult
+    bounce_frame: int
+    first_frame: int
+    last_frame: int
+    n_detections: int
+    after_bounce: bool
+
+    def positions_table(self, cal: Calibration3D, frames) -> np.ndarray:
+        """Positions [N,3] in signed table metres at the given frame numbers,
+        including frames the detector never saw: inside a validated span the
+        arc is the best statement available about where the ball was."""
+        t = (np.atleast_1d(np.asarray(frames, dtype=np.float64)) - self.fit.t0_frame) / cal.fps
+        return np.array([cal.to_table(self.fit.state_at(float(ti))[0]) for ti in t])
+
+
+def grow_arc_from_bounce(cal: Calibration3D, frames, uv, bounce: BounceEvent,
+                          after_bounce: bool = True) -> Optional[BounceArc]:
+    """Longest arc from ``bounce`` that still explains the detector's pixels.
+
+    ``frames``/``uv`` are detections in chronological order with the bounce at
+    the near end -- the frames after it when ``after_bounce``, the frames
+    before it otherwise, so that the flight into a bounce and the flight out
+    of it are each fitted on their own side of whatever separates them.
+
+    The window grows a frame at a time and stops at the first one that breaks
+    either reprojection (``MAX_REPROJ_RMS_PX``) or physical plausibility.
+    Returns None when even the shortest window fails, which is the honest
+    answer for a bounce whose flight the detector did not follow.
+    """
+    frames = np.atleast_1d(np.asarray(frames))
+    uv = np.atleast_2d(np.asarray(uv, dtype=np.float64))
+    n = len(frames)
+    if n < MIN_FIT_WINDOW_ANCHORED:
+        return None
+
+    best = None
+    for k in range(MIN_FIT_WINDOW_ANCHORED, n + 1):
+        win_f, win_uv = (frames[:k], uv[:k]) if after_bounce else (frames[n - k:], uv[n - k:])
+        fit = fit_arc_causal(cal, win_f, win_uv, anchor=bounce)
+        if not fit.ok or fit.rms_px > MAX_REPROJ_RMS_PX:
+            break
+        span_s = (win_f[-1] - fit.t0_frame) / cal.fps
+        # Plausible at both ends and at the apex, not at one sample: a fit can
+        # sit on the table at the frames it was given and dive through it in
+        # between.
+        if not all(fit.plausible(cal, t) for t in (0.0, span_s / 2.0, span_s)):
+            break
+        best = (fit, win_f)
+
+    if best is None:
+        return None
+    fit, win_f = best
+    return BounceArc(fit=fit, bounce_frame=int(bounce.frame),
+                      first_frame=int(win_f[0]), last_frame=int(win_f[-1]),
+                      n_detections=len(win_f), after_bounce=after_bounce)

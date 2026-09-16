@@ -21,6 +21,15 @@ untouched:
     mostly declines to publish at all; the interpolation lands 7.7 px.
     Use these columns for building a track after the fact; use the causal
     ones for anything that has to run live.
+  * the table contact point of every detected bounce (``BounceX``/
+    ``BounceY``), which the causal columns cannot carry because a bounce is
+    only confirmed two frames after it happens;
+  * one gravity arc either side of every bounce (``WorldXArc``/``WorldYArc``/
+    ``WorldZArc``/``ArcSource``/``ArcBounceFrame``), anchored at the contact
+    and grown over the detector's own pixels for as long as they keep
+    agreeing with it -- a continuous flight path across frames the causal
+    reconstruction declines to publish at all, including the opening frames
+    of every flight;
   * optionally, a re-rendered video with the always-on radar-gun HUD
     (task 1), whose direction is the screen-space Kalman heading -- see
     ``radar_hud.py`` for why that is the only source used.
@@ -74,10 +83,13 @@ from utils.ball_kinematics_3d import (
     load_calibration_3d,
     detect_bounce_causal,
     fit_arc_causal,
+    grow_arc_from_bounce,
     BounceEvent,
+    BALL_RADIUS_M,
     MIN_FIT_WINDOW,
     MIN_FIT_WINDOW_ANCHORED,
     MAX_FIT_WINDOW,
+    MAX_ARC_SPAN_SEC,
 )
 from utils.radar_hud import draw_radar_hud
 
@@ -91,6 +103,8 @@ EXTENDED_COLUMNS = [
     "Confidence", "ScaleSource", "IsBounce", "BounceConfirmFrame", "PosSigmaPx",
     "SpeedKmhRaw",
     "XSmooth", "YSmooth", "SmoothSource", "SmoothTurnDeg",
+    "BounceX", "BounceY",
+    "WorldXArc", "WorldYArc", "WorldZArc", "ArcSource", "ArcBounceFrame",
 ]
 
 # --- reconstructed track (non-causal, for building a continuous path) -----
@@ -340,6 +354,83 @@ def _fill_inplay_gaps(rows: list[dict], pos: list, vel: list) -> int:
     return filled
 
 
+def _fit_bounce_arcs(rows: list[dict], cal, fps: float) -> tuple[int, int]:
+    """Fit one gravity arc either side of every detected bounce.
+
+    Writes WorldXArc/WorldYArc/WorldZArc/ArcSource/ArcBounceFrame.
+    Non-causal, like the pass above and for the same kind of reason -- it
+    picks its window by looking at frames the bounce has not reached yet --
+    so it stays out of every causal column. ``grow_arc_from_bounce`` carries the measurements behind
+    the model; this function is only the bookkeeping around it.
+
+    Each bounce gets two windows: forward, over the flight leaving the
+    contact, and backward, over the flight arriving at it. Whatever separates
+    them -- a racket, a bounce the detector missed -- ends both, because that
+    is where the pixels stop agreeing with one parabola.
+
+    Where a forward and a backward arc overlap, the forward one keeps the
+    frames. Its anchor sits at the start of its own window, so every frame it
+    covers is fitted forward from a known contact rather than extrapolated
+    back towards one.
+
+    ``ArcBounceFrame`` names the bounce each row's arc was anchored to. Two
+    arcs of the same kind can end up on adjacent frames -- a forward arc runs
+    up to the next bounce, whose own forward arc carries on from there -- and
+    they are different parabolas: on the reference recording 36 of 727 spans
+    are such a pair. Without the anchor a consumer cannot tell where one ends
+    and would draw the join as a kink.
+
+    Returns (arcs written, frames an arc now covers).
+    """
+    if cal is None or not cal.has_pose:
+        return 0, 0
+    for r in rows:
+        r["WorldXArc"] = r["WorldYArc"] = r["WorldZArc"] = ""
+        r["ArcSource"] = r["ArcBounceFrame"] = ""
+
+    bounces = [i for i, r in enumerate(rows) if r["IsBounce"] and r["BounceX"] != ""]
+    if not bounces:
+        return 0, 0
+
+    detected = np.array([i for i, r in enumerate(rows)
+                         if r["Source"] == "measured" and r["Xf"] != ""])
+    if len(detected) < MIN_FIT_WINDOW_ANCHORED:
+        return 0, 0
+    detected_uv = np.array([[rows[i]["Xf"], rows[i]["Yf"]] for i in detected], dtype=np.float64)
+
+    max_span = int(round(MAX_ARC_SPAN_SEC * fps))
+    arcs = 0
+    for pos, b in enumerate(bounces):
+        anchor = BounceEvent(b, np.array([rows[b]["BounceX"], rows[b]["BounceY"], BALL_RADIUS_M]))
+        prev_b = bounces[pos - 1] if pos else -1
+        next_b = bounces[pos + 1] if pos + 1 < len(bounces) else len(rows)
+        for after in (True, False):
+            if after:
+                lo, hi = b, min(b + max_span, next_b)
+            else:
+                lo, hi = max(b - max_span, prev_b), b
+            sel = (detected >= lo) & (detected <= hi)
+            arc = grow_arc_from_bounce(cal, detected[sel], detected_uv[sel],
+                                        anchor, after_bounce=after)
+            if arc is None:
+                continue
+            frames = np.arange(arc.first_frame, arc.last_frame + 1)
+            P = arc.positions_table(cal, frames)
+            source = "afterBounce" if after else "beforeBounce"
+            wrote = False
+            for f, p in zip(frames, P):
+                if rows[f]["ArcSource"] != "":
+                    continue
+                rows[f]["WorldXArc"] = round(float(p[0]), 4)
+                rows[f]["WorldYArc"] = round(float(p[1]), 4)
+                rows[f]["WorldZArc"] = round(float(p[2]), 4)
+                rows[f]["ArcSource"] = source
+                rows[f]["ArcBounceFrame"] = arc.bounce_frame
+                wrote = True
+            arcs += wrote
+    return arcs, sum(1 for r in rows if r["ArcSource"] != "")
+
+
 def _video_looks_complete(video_out: Path, recording_dir: Path, segment: str) -> bool:
     """True when an existing rendered video covers the whole segment.
 
@@ -495,6 +586,7 @@ def process_segment(recording_dir: Path, segment: str, render_video: bool,
         scale_source = "none"
         confidence = 0.0
         is_bounce_row = False
+        bounce_point = None
 
         # A measured frame is trustworthy by construction; a dead-reckoned one
         # only while the filter's own uncertainty stays under the bar. An
@@ -550,11 +642,24 @@ def process_segment(recording_dir: Path, segment: str, render_video: bool,
                 # columns are touched. The anchor itself is still applied
                 # strictly forward from this frame, so speed/direction/3-D on
                 # every row stay causal.
+                #
+                # BounceX/BounceY ride along for the same reason and under the
+                # same rule. The contact point is the one place on a flight
+                # where the ball's world position is known outright rather
+                # than fitted -- the ray through it meets a plane of known
+                # height -- and downstream (the arc pass below, a bounce map)
+                # it is the anchor everything else hangs off. But it is only
+                # knowable BOUNCE_CONFIRM_LAG frames late, so it is not
+                # causal, so it does not go in WorldX/Y/Z. Its own columns
+                # say what it is.
                 if 0 <= ev.frame < len(rows):
                     rows[ev.frame]["IsBounce"] = True
                     rows[ev.frame]["BounceConfirmFrame"] = i
+                    rows[ev.frame]["BounceX"] = round(float(ev.point_table[0]), 4)
+                    rows[ev.frame]["BounceY"] = round(float(ev.point_table[1]), 4)
                 else:
                     is_bounce_row = True
+                    bounce_point = ev.point_table
                 # Speed genuinely steps across a bounce; don't smooth over it.
                 speed_ema = None
             else:
@@ -666,6 +771,8 @@ def process_segment(recording_dir: Path, segment: str, render_video: bool,
             "ScaleSource": scale_source,
             "IsBounce": is_bounce_row,
             "BounceConfirmFrame": "",
+            "BounceX": round(float(bounce_point[0]), 4) if bounce_point is not None else "",
+            "BounceY": round(float(bounce_point[1]), 4) if bounce_point is not None else "",
             "PosSigmaPx": round(ts.pos_sigma, 2) if math.isfinite(ts.pos_sigma) else "",
             "SpeedKmhRaw": round(speed_kmh_raw, 2),
         })
@@ -713,6 +820,13 @@ def process_segment(recording_dir: Path, segment: str, render_video: bool,
     log.info("reconstructed track: %d measured + %d interpolated = %d of %d "
              "frames (%.1f%%)", n_meas, filled, n_meas + filled, n,
              100.0 * (n_meas + filled) / max(n, 1))
+
+    n_bounces = sum(1 for r in rows if r["IsBounce"])
+    arcs, arc_frames = _fit_bounce_arcs(rows, cal, fps)
+    n_causal_3d = sum(1 for r in rows if r["WorldZ"] != "")
+    log.info("bounce arcs: %d fitted around %d bounces, covering %d frames "
+             "in 3-D against %d the causal pass reconstructed",
+             arcs, n_bounces, arc_frames, n_causal_3d)
 
     out_df = pd.DataFrame(rows, columns=EXTENDED_COLUMNS)
     out_df.to_csv(csv_out, index=False)
