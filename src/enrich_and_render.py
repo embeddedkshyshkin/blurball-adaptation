@@ -9,6 +9,17 @@ and produces, causally and frame-by-frame:
     (``ball_kinematics_3d.py``);
   * an extended CSV with world position, speed, both headings, and a
     confidence/provenance trail (task 3);
+
+and then, in a separate non-causal pass that leaves every column above
+untouched:
+
+  * a reconstructed image-space track (``XSmooth``/``YSmooth``) that fills
+    the short gaps where the detector lost a ball that was still in play,
+    by interpolating between the real detections that bracket the gap.
+    Forward prediction cannot do this -- it lands a median 362 px away
+    against an independent detector, where bracketed interpolation lands
+    7.7 px. Use these columns for building a track after the fact; use the
+    causal ones for anything that has to run live.
   * optionally, a re-rendered video with the always-on radar-gun HUD
     (task 1), whose direction is the screen-space Kalman heading -- see
     ``radar_hud.py`` for why that is the only source used.
@@ -78,7 +89,56 @@ EXTENDED_COLUMNS = [
     "SpeedKmh", "ScreenDirDeg", "TableHeadingDeg",
     "Confidence", "ScaleSource", "IsBounce", "BounceConfirmFrame", "PosSigmaPx",
     "SpeedKmhRaw",
+    "XSmooth", "YSmooth", "SmoothSource", "SmoothTurnDeg",
 ]
+
+# --- reconstructed track (non-causal, for building a continuous path) -----
+#
+# Everything above is causal: no row is influenced by a later frame. That is
+# right for the on-video gauge, but it is the wrong tool for "the detector
+# missed six frames in the middle of a shot and I need those positions".
+# Extrapolating forward through such a gap is hopeless -- measured against an
+# independent detector on in-play gaps, the causal Kalman prediction lands a
+# median 362px from the ball (segments 000-002, where that detector's own
+# sightings pin down which gaps really had a ball in them). Interpolating
+# between the accepted detections that BRACKET the gap lands 7.7px away
+# (all 13 segments), because it is anchored at both ends and cannot diverge.
+#
+# So the reconstruction lives in its own columns and is labelled: XSmooth /
+# YSmooth / SmoothSource, with every causal column left untouched. A gap is
+# only filled when real detections bracket it, which is most of the user's
+# "only during a shot" condition -- when the ball leaves play the track dies
+# with no closing bracket, so nothing is invented for it. The rest of that
+# condition is the two gates below, which reject a bracket pair that cannot
+# be the same flight; without them a spurious detection landing within 8
+# frames of a dead track supplies a closing bracket the ball never earned.
+MAX_INTERP_GAP_FRAMES = 8
+# A ball cannot cross the frame in three frames. An implausible chord means
+# one of the two brackets is a spurious detection belonging to something
+# else, so the pair should not be joined at all. Costs ~6% of fillable
+# frames on the reference recording.
+MAX_INTERP_CHORD_PX_PER_FRAME = 80.0
+INTERP_CTX_FRAMES = 4
+INTERP_QUAD_MAX_RESID_PX = 6.0
+# The chord gate above only catches brackets that are absurdly far apart. It
+# misses the other way a bracket pair can be bogus: the ball was crawling on
+# one side of the gap and the chord across it is an order of magnitude
+# faster. That is the "ball came to rest or left play, and the detector
+# latched onto something else within 8 frames" case -- the closing bracket
+# exists but does not belong to the same flight, so the structural guarantee
+# ("no closing bracket, no fill") does not cover it.
+#
+# Measured on segments 000-002: 47 of 758 runs trip this, 181 of 2579 filled
+# frames. Those frames sit 77.6 px from an independent detector's ball with
+# only 17% inside 25 px, against 10.7 px and 66% for the rest, 71% of them
+# close on a single isolated detection with no measured neighbour (41%
+# baseline), and the independent detector saw any ball at all in just 3.3% of
+# them versus 6.4% elsewhere -- it agrees nothing was there.
+#
+# The floor keeps slow-ball jitter out: a 1 px/frame step next to a 3
+# px/frame chord is a 3x ratio and means nothing.
+MIN_BRACKET_SPEED_RATIO = 5.0
+BRACKET_RATE_FLOOR_PX_PER_FRAME = 20.0
 
 # Above this the Kalman filter's own positional uncertainty says its
 # dead-reckoned position is not worth building anything on. Measured on
@@ -154,6 +214,124 @@ def _manifest_frame_count(recording_dir: Path, segment: str) -> int | None:
             count = seg.get("frameCount")
             return int(count) if isinstance(count, (int, float)) else None
     return None
+
+
+def _fill_inplay_gaps(rows: list[dict], pos: list, vel: list) -> int:
+    """Reconstruct ball positions across gaps that real detections bracket.
+
+    Writes XSmooth/YSmooth/SmoothSource/SmoothTurnDeg. Non-causal by
+    construction -- it reads the detection on the far side of the gap -- which
+    is why it is kept out of every column the causal contract covers.
+
+    ``SmoothTurnDeg`` is the angle between the track's velocity entering the
+    gap and the straight line across it. Near 0 the ball flew straight
+    through and the fill is trustworthy; large values mean it changed
+    direction in there (a racket hit, or a bounce the detector never saw), so
+    a straight path cuts the corner.
+
+    It is reported rather than gated on, and it only means anything while the
+    ball is moving. Measured against an independent detector across all 13
+    segments of the reference recording, for fills where the chord exceeds
+    5 px/frame: turn <= 20 deg gives 6.1 px median error and 78% within
+    25 px, turn > 20 deg gives 20.0 px and 51%. Below 5 px/frame the chord is
+    too short to define a direction and the angle is jitter -- most of those
+    frames read over 20 deg while still landing 4.8 px from truth. So the
+    useful filter is "keep the frame unless it is both moving and turning",
+    and gating it here would throw away two thirds of the frames this exists
+    to fill.
+
+    To apply that filter downstream: the chord rate is just the step between
+    consecutive XSmooth/YSmooth rows, so
+
+        step = hypot(diff(XSmooth), diff(YSmooth))
+        drop = (SmoothSource == "interpolated") & (step >= 5)
+               & (SmoothTurnDeg > 20)
+
+    Note ``SmoothTurnDeg`` is blank when the track had no velocity entering
+    the gap (a cold start -- 8% of filled frames). Blank parses as NaN, and
+    ``NaN > 20`` is False, so those frames are kept by the expression above;
+    write the test in that direction rather than as ``<= 20``, which would
+    silently drop them.
+
+    Filling the corner instead of cutting it was tried and rejected: fitting
+    the incoming and outgoing directions and intersecting them yields usable
+    geometry on under a fifth of the high-turn frames, and on those it is
+    worse than the straight chord (58 px vs 48 px median, 22% vs 44% within
+    25 px) while also degrading the frames that were already good.
+
+    Returns the number of frames filled.
+    """
+    n = len(rows)
+    for r in rows:
+        r["XSmooth"] = r["YSmooth"] = r["SmoothSource"] = r["SmoothTurnDeg"] = ""
+    for i in range(n):
+        if pos[i] is not None:
+            rows[i]["XSmooth"] = round(pos[i][0], 2)
+            rows[i]["YSmooth"] = round(pos[i][1], 2)
+            rows[i]["SmoothSource"] = "measured"
+
+    meas = [i for i in range(n) if pos[i] is not None]
+    meas_set = set(meas)
+    filled = 0
+    for a, b in zip(meas[:-1], meas[1:]):
+        span = b - a
+        if not (1 < span <= MAX_INTERP_GAP_FRAMES + 1):
+            continue
+        (x0, y0), (x1, y1) = pos[a], pos[b]
+        rate = math.hypot(x1 - x0, y1 - y0) / span
+        if rate > MAX_INTERP_CHORD_PX_PER_FRAME:
+            continue
+
+        # How fast was the ball actually moving either side of the gap? Only
+        # an immediately adjacent measurement answers that; anything further
+        # away is itself across a gap and begs the question.
+        steps = []
+        if a - 1 >= 0 and pos[a - 1] is not None:
+            steps.append(math.hypot(x0 - pos[a - 1][0], y0 - pos[a - 1][1]))
+        if b + 1 < n and pos[b + 1] is not None:
+            steps.append(math.hypot(pos[b + 1][0] - x1, pos[b + 1][1] - y1))
+        if (steps and rate > BRACKET_RATE_FLOOR_PX_PER_FRAME
+                and rate > MIN_BRACKET_SPEED_RATIO * max(steps)):
+            continue
+
+        turn = float("nan")
+        v = vel[a]
+        if v is not None:
+            vn, cn = math.hypot(*v), math.hypot(x1 - x0, y1 - y0)
+            if vn > 1e-6 and cn > 1e-6:
+                cosang = (v[0] * (x1 - x0) + v[1] * (y1 - y0)) / (vn * cn)
+                turn = math.degrees(math.acos(max(-1.0, min(1.0, cosang))))
+
+        # Prefer a quadratic (it can bend with gravity) when there is enough
+        # bracketing context and it actually describes that context; fall
+        # back to the straight chord otherwise.
+        quad = None
+        ctx = [f for f in range(max(0, a - INTERP_CTX_FRAMES), a + 1) if f in meas_set]
+        ctx += [f for f in range(b, min(n, b + INTERP_CTX_FRAMES + 1)) if f in meas_set]
+        if len(ctx) >= 4:
+            tt = np.array(ctx, dtype=float)
+            xs = np.array([pos[f][0] for f in ctx])
+            ys = np.array([pos[f][1] for f in ctx])
+            cx, cy = np.polyfit(tt, xs, 2), np.polyfit(tt, ys, 2)
+            resid = float(np.sqrt(np.mean((xs - np.polyval(cx, tt)) ** 2
+                                          + (ys - np.polyval(cy, tt)) ** 2)))
+            if resid <= INTERP_QUAD_MAX_RESID_PX:
+                quad = (cx, cy)
+
+        for f in range(a + 1, b):
+            if quad is not None:
+                fx = float(np.polyval(quad[0], f))
+                fy = float(np.polyval(quad[1], f))
+            else:
+                t = (f - a) / span
+                fx, fy = x0 + (x1 - x0) * t, y0 + (y1 - y0) * t
+            rows[f]["XSmooth"] = round(fx, 2)
+            rows[f]["YSmooth"] = round(fy, 2)
+            rows[f]["SmoothSource"] = "interpolated"
+            if math.isfinite(turn):
+                rows[f]["SmoothTurnDeg"] = round(turn, 1)
+            filled += 1
+    return filled
 
 
 def _video_looks_complete(video_out: Path, recording_dir: Path, segment: str) -> bool:
@@ -281,6 +459,10 @@ def process_segment(recording_dir: Path, segment: str, render_video: bool,
     speed_ema: float | None = None
 
     rows = []
+    # Accepted-detection positions and the track velocity entering each
+    # frame, kept for the non-causal reconstruction pass after the loop.
+    track_pos: list = [None] * n
+    track_vel: list = [None] * n
     lo, hi = frame_range if frame_range else (0, n - 1)
     t_start = time.time()
 
@@ -317,6 +499,13 @@ def process_segment(recording_dir: Path, segment: str, render_video: bool,
         # and a jumping speed on the rendered video.
         trusted = source == "measured" or (
             source == "predicted" and ts.pos_sigma <= MAX_TRUSTED_POS_SIGMA_PX)
+
+        if source == "measured":
+            track_pos[i] = (ts.x, ts.y)
+        if source != "none":
+            # On a "none" row the tracker reports zero velocity because there
+            # is no track, not because the ball is still; don't store that.
+            track_vel[i] = (ts.vx, ts.vy)
 
         if trusted:
             hist_frames.append(i)
@@ -512,6 +701,12 @@ def process_segment(recording_dir: Path, segment: str, render_video: bool,
         cap.release()
     if writer is not None:
         writer.release()
+
+    filled = _fill_inplay_gaps(rows, track_pos, track_vel)
+    n_meas = sum(1 for p in track_pos if p is not None)
+    log.info("reconstructed track: %d measured + %d interpolated = %d of %d "
+             "frames (%.1f%%)", n_meas, filled, n_meas + filled, n,
+             100.0 * (n_meas + filled) / max(n, 1))
 
     out_df = pd.DataFrame(rows, columns=EXTENDED_COLUMNS)
     out_df.to_csv(csv_out, index=False)
