@@ -115,3 +115,247 @@ def load_trajectory(traj_path, imgs_paths, model_name):
 
     print(f"Reusing trajectory: {traj_path} ({len(result_dict)} frames)")
     return result_dict
+
+
+@torch.no_grad()
+def inference_video(
+    detector,
+    tracker,
+    input_video_path,
+    frame_dir,
+    cfg,
+    vis_frame_dir=None,
+    vis_hm_dir=None,
+    vis_traj_path=None,
+    dist_thresh=10.0,
+    existing_traj_path=None,
+    traj_output_path=None,
+    output_video_path=None,
+    preloaded_speed_homography=None,
+):
+    t_start = time.time()
+    num_frames = 0
+    print("Starting********")
+
+    imgs_paths = sorted(Path(frame_dir).glob("*.png"))
+    if not imgs_paths:
+        raise ValueError(f"No extracted PNG frames found in {frame_dir}")
+
+    cap = cv2.VideoCapture(str(input_video_path))
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    cap.release()
+    if not fps or fps <= 0:
+        raise ValueError("Could not determine source video FPS")
+
+    hm_results = defaultdict(list)
+    if existing_traj_path is not None:
+        result_dict = load_trajectory(existing_traj_path, imgs_paths, cfg["model"]["name"])
+    else:
+        c = np.array([w / 2.0, h / 2.0], dtype=np.float32)
+        s = max(h, w) * 1.0
+        trans = np.stack(
+            [get_affine_transform(c, s, 0, [cfg["model"]["inp_width"], cfg["model"]["inp_height"]], inv=1) for _ in range(3)],
+            axis=0,
+        )
+        trans = torch.tensor(trans)[None, :]
+        preprocess_frame = T.Compose(
+            [
+                T.ToPILImage(),
+                T.Resize((cfg["model"]["inp_height"], cfg["model"]["inp_width"])),
+                T.ToTensor(),
+                T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+            ]
+        )
+        step = cfg["detector"]["step"]
+        det_results = defaultdict(list)
+        img_paths_buffer = []
+        frames_buffer = []
+        for img_path in imgs_paths:
+            frame = cv2.imread(str(img_path))
+            frames_buffer.append(frame)
+            img_paths_buffer.append(str(img_path))
+            if len(frames_buffer) == cfg["model"]["frames_in"]:
+                frames_processed = [preprocess_frame(f) for f in frames_buffer]
+                input_tensor = torch.cat(frames_processed, dim=0).unsqueeze(0)
+                batch_results, hms_vis = detector.run_tensor(input_tensor, trans)
+                for ie in batch_results[0].keys():
+                    path = img_paths_buffer[ie]
+                    preds = batch_results[0][ie]
+                    det_results[path].extend(preds)
+                    hm_results[path].extend(hms_vis[0][ie])
+                if step == 1:
+                    frames_buffer.pop(0)
+                    img_paths_buffer.pop(0)
+                elif step == 3:
+                    img_paths_buffer = []
+                    frames_buffer = []
+
+        tracker.refresh()
+        result_dict = {}
+        print("Running tracker")
+        for img_path, preds in det_results.items():
+            result_dict[img_path] = tracker.update(preds)
+        print("Finished tracking")
+
+    t_elapsed = time.time() - t_start
+
+    x_fin, y_fin, vis_fin = [], [], []
+    if cfg["model"]["name"] == "blurball":
+        l_fin, theta_fin = [], []
+
+    vis_cfg = cfg.get("runner", {}).get("visualization", {})
+    show_speed_direction = bool(vis_cfg.get("show_speed_direction", False))
+    calibration_file = cfg.get("calibration_file", None)
+    speed_window = max(3, int(vis_cfg.get("speed_window_frames", 7)))
+    direction_window = max(3, int(vis_cfg.get("direction_window_frames", 5)))
+    smoothing_alpha = float(vis_cfg.get("speed_smoothing_alpha", 0.25))
+    direction_change_threshold_deg = float(vis_cfg.get("direction_change_threshold_deg", 115.0))
+    direction_min_distance_m = float(vis_cfg.get("direction_min_distance_m", 0.015))
+    min_speed_kmh = float(vis_cfg.get("direction_min_speed_kmh", 2.0))
+    reversal_confirm_frames = max(1, int(vis_cfg.get("reversal_confirm_frames", 3)))
+    direction_smoothing_alpha = float(vis_cfg.get("direction_smoothing_alpha", 0.35))
+    hud_position = vis_cfg.get("hud_position", "top_center")
+
+    speed_homography = preloaded_speed_homography
+    motion_estimator = None
+    kinematic_states = None
+    if show_speed_direction:
+        if not calibration_file:
+            print("Calibration not provided; speed/direction calculation is disabled")
+            show_speed_direction = False
+        else:
+            kinematic_states = _motion_states_from_trajectory(
+                result_dict, fps, calibration_file, vis_cfg
+            )
+            if kinematic_states is not None:
+                print("Using gravity-constrained 3D kinematics for speed/direction")
+            elif speed_homography is None:
+                speed_homography = load_speed_calibration(calibration_file)
+                print("Loaded PongEye calibration from " + str(calibration_file))
+            if kinematic_states is None:
+                motion_estimator = MotionEstimator(
+                    fps=fps,
+                    speed_window_frames=speed_window,
+                    direction_window_frames=direction_window,
+                    speed_smoothing_alpha=smoothing_alpha,
+                    direction_change_threshold_deg=direction_change_threshold_deg,
+                    min_displacement_m=direction_min_distance_m,
+                    min_speed_kmh=min_speed_kmh,
+                    reversal_confirm_frames=reversal_confirm_frames,
+                    direction_smoothing_alpha=direction_smoothing_alpha,
+                )
+
+    for cnt, img_path in enumerate(result_dict.keys()):
+        x_pred = result_dict[img_path]["x"]
+        y_pred = result_dict[img_path]["y"]
+        visi_pred = result_dict[img_path]["visi"]
+        score_pred = result_dict[img_path]["score"]
+        if cfg["model"]["name"] == "blurball":
+            angle_pred = result_dict[img_path]["angle"]
+            length_pred = result_dict[img_path]["length"]
+
+        x_fin.append(int(min(max(x_pred, 0), 100000)))
+        y_fin.append(int(min(max(y_pred, 0), 100000)))
+        vis_fin.append(int(visi_pred))
+        if cfg["model"]["name"] == "blurball":
+            theta_fin.append(angle_pred)
+            l_fin.append(length_pred)
+
+        current_speed_kmh = 0.0
+        current_direction_rad = None
+        if kinematic_states is not None and visi_pred:
+            current_speed_kmh, current_direction_rad = kinematic_states.get(img_path, (0.0, None))
+        elif motion_estimator is not None and visi_pred:
+            table_position = project_to_table((float(x_pred), float(y_pred)), speed_homography)
+            current_speed_kmh, current_direction_rad = motion_estimator.update(cnt, table_position)
+        elif motion_estimator is not None:
+            motion_estimator.reset()
+
+        if not visi_pred:
+            current_speed_kmh = 0.0
+            current_direction_rad = None
+
+        if vis_frame_dir is not None:
+            vis_frame_path = osp.join(vis_frame_dir, osp.basename(img_path))
+            vis_pred = cv2.imread(img_path)
+
+            color_pred = (255, 0, 0)
+            if cfg["model"]["name"] == "blurball":
+                vis_pred = draw_frame(
+                    vis_pred,
+                    center=Center(is_visible=visi_pred, x=x_pred, y=y_pred),
+                    color=color_pred,
+                    radius=3,
+                    angle=angle_pred,
+                    l=length_pred,
+                )
+            else:
+                vis_pred = draw_frame(
+                    vis_pred,
+                    center=Center(is_visible=visi_pred, x=x_pred, y=y_pred),
+                    color=color_pred,
+                    radius=3,
+                )
+
+            if show_speed_direction:
+                vis_pred = draw_speed_direction_hud(
+                    vis_pred,
+                    current_speed_kmh,
+                    current_direction_rad,
+                    position=hud_position,
+                )
+
+            cv2.imwrite(vis_frame_path, vis_pred)
+
+            if vis_hm_dir is not None:
+                hm_path = osp.join(vis_hm_dir, osp.basename(img_path))
+                if img_path in hm_results and hm_results[img_path]:
+                    vis_hm_pred = cv2.cvtColor(
+                        (255 * hm_results[img_path][0]["hm"]).astype(np.uint8),
+                        cv2.COLOR_GRAY2RGB,
+                    )
+                    vis_hm_pred = cv2.resize(vis_hm_pred, (1280, 720))
+                    vis_hm_pred = draw_frame(
+                        vis_hm_pred,
+                        center=Center(is_visible=visi_pred, x=x_pred, y=y_pred),
+                        color=color_pred,
+                        radius=3,
+                        angle=angle_pred if cfg["model"]["name"] == "blurball" else None,
+                        l=length_pred if cfg["model"]["name"] == "blurball" else None,
+                    )
+                    if show_speed_direction:
+                        vis_hm_pred = draw_speed_direction_hud(
+                            vis_hm_pred,
+                            current_speed_kmh,
+                            current_direction_rad,
+                            position=hud_position,
+                        )
+                    cv2.imwrite(hm_path, vis_hm_pred)
+
+    if vis_frame_dir is not None:
+        video_path = output_video_path or "{}.mp4".format(vis_frame_dir)
+        gen_video(video_path, vis_frame_dir, fps=fps)
+        print("Saving video at " + video_path)
+
+    if existing_traj_path is None:
+        if cfg["model"]["name"] == "blurball":
+            df = pd.DataFrame(
+                {
+                    "Frame": x_fin,
+                    "X": x_fin,
+                    "Y": y_fin,
+                    "Visibility": vis_fin,
+                    "L": l_fin,
+                    "Theta": theta_fin,
+                }
+            )
+        else:
+            df = pd.DataFrame({"Frame": x_fin, "X": x_fin, "Y": y_fin, "Visibility": vis_fin})
+        df["Frame"] = df.index
+        csv_path = str(traj_output_path or (Path(frame_dir) / "traj.csv"))
+        df.to_csv(csv_path, index=False)
+        print("Saving csv at " + csv_path)
+
+    return {"t_elapsed": t_elapsed, "num_frames": num_frames}
