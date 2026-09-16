@@ -16,10 +16,11 @@ untouched:
   * a reconstructed image-space track (``XSmooth``/``YSmooth``) that fills
     the short gaps where the detector lost a ball that was still in play,
     by interpolating between the real detections that bracket the gap.
-    Forward prediction cannot do this -- it lands a median 362 px away
-    against an independent detector, where bracketed interpolation lands
-    7.7 px. Use these columns for building a track after the fact; use the
-    causal ones for anything that has to run live.
+    Forward prediction cannot do this -- on those same frames it lands a
+    median 344.7 px from where an independent detector saw the ball, and
+    mostly declines to publish at all; the interpolation lands 7.7 px.
+    Use these columns for building a track after the fact; use the causal
+    ones for anything that has to run live.
   * optionally, a re-rendered video with the always-on radar-gun HUD
     (task 1), whose direction is the screen-space Kalman heading -- see
     ``radar_hud.py`` for why that is the only source used.
@@ -97,12 +98,15 @@ EXTENDED_COLUMNS = [
 # Everything above is causal: no row is influenced by a later frame. That is
 # right for the on-video gauge, but it is the wrong tool for "the detector
 # missed six frames in the middle of a shot and I need those positions".
-# Extrapolating forward through such a gap is hopeless -- measured against an
-# independent detector on in-play gaps, the causal Kalman prediction lands a
-# median 362px from the ball (segments 000-002, where that detector's own
-# sightings pin down which gaps really had a ball in them). Interpolating
-# between the accepted detections that BRACKET the gap lands 7.7px away
-# (all 13 segments), because it is anchored at both ends and cannot diverge.
+# Extrapolating forward through such a gap is hopeless. On exactly the frames
+# this pass fills, where the desktop app's auto-label detector independently
+# saw the ball (n=582 across all 13 segments), the causal Kalman prediction
+# in Xf/Yf lands a median 344.7px away and inside 25px only 9% of the time.
+# The interpolation below lands 7.7px away and inside 25px 68% of the time,
+# and is the closer of the two on 90% of those frames, because it is anchored
+# at both ends and cannot diverge. The causal path also declines to publish
+# 80% of them outright (PosSigmaPx > MAX_TRUSTED_POS_SIGMA_PX), so for most
+# of these frames the alternative is not a worse position but no position.
 #
 # So the reconstruction lives in its own columns and is labelled: XSmooth /
 # YSmooth / SmoothSource, with every causal column left untouched. A gap is
@@ -255,9 +259,11 @@ def _fill_inplay_gaps(rows: list[dict], pos: list, vel: list) -> int:
 
     Filling the corner instead of cutting it was tried and rejected: fitting
     the incoming and outgoing directions and intersecting them yields usable
-    geometry on under a fifth of the high-turn frames, and on those it is
-    worse than the straight chord (58 px vs 48 px median, 22% vs 44% within
-    25 px) while also degrading the frames that were already good.
+    geometry on under a fifth of the high-turn frames, it was no better than
+    the straight chord on those, and it degraded the frames that were already
+    good. (Measured before the bracket-consistency gate below existed, so the
+    magnitudes would differ today; the second finding is what settles it, and
+    that gate does not touch it.)
 
     Returns the number of frames filled.
     """
