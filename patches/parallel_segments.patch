@@ -1,0 +1,171 @@
+--- a/src/runners/inference.py
++++ b/src/runners/inference.py
+@@ -9,6 +9,7 @@
+ import time
+ import logging
+ from collections import defaultdict
++from concurrent.futures import ProcessPoolExecutor, as_completed
+ from tqdm import tqdm
+ from omegaconf import DictConfig, OmegaConf
+ import hydra
+@@ -423,6 +424,55 @@
+             return result
+ 
+ 
++def _process_segment_worker(args):
++    """Top-level worker for ProcessPoolExecutor (must be picklable).
++
++    Each worker loads its own detector on the GPU. Keep
++    ``runner.num_parallel_segments`` modest (typically 1-2 on a single GPU)
++    to avoid VRAM exhaustion.
++    """
++    (
++        segment_path,
++        csv_path,
++        mode,
++        annotated_video_path,
++        cfg_container,
++        calibration_file,
++        index,
++        total,
++    ) = args
++
++    # Reconstruct a DictConfig so downstream code keeps working unchanged.
++    cfg = OmegaConf.create(cfg_container)
++    if calibration_file:
++        cfg["calibration_file"] = calibration_file
++
++    # Ensure CUDA is selected inside the child process.
++    if torch.cuda.is_available():
++        cfg["runner"]["device"] = "cuda"
++        cfg["runner"]["gpus"] = [0]
++
++    print(f"[{index}/{total}] [worker] Processing {Path(segment_path).name}")
++    try:
++        # Load model path from detector config if present; otherwise build_detector
++        # will use whatever is already configured.
++        processor = VideoInferenceProcessor(cfg, model=None, preloaded_speed_homography=None)
++        processor.process(
++            segment_path,
++            csv_path,
++            mode,
++            annotated_video_path=annotated_video_path,
++        )
++        return {"status": "ok", "name": Path(segment_path).name, "index": index}
++    except Exception as exc:
++        return {
++            "status": "error",
++            "name": Path(segment_path).name,
++            "index": index,
++            "error": str(exc),
++        }
++
++
+ class RecordingInferenceRunner:
+     """Process a PongEye recording folder segment-by-segment."""
+ 
+@@ -434,6 +484,10 @@
+         self.recording_dir = Path(cfg["input_folder"])
+         self.mode = str(cfg["runner"].get("mode", "standard"))
+         self.overwrite = bool(cfg.get("overwrite", False))
++        # Parallel segment processing (ProcessPoolExecutor). Default 1 = sequential.
++        self.num_parallel = int(cfg["runner"].get("num_parallel_segments", 1))
++        if self.num_parallel < 1:
++            raise ValueError("runner.num_parallel_segments must be >= 1")
+         if self.mode not in {"standard", "csv_only", "trajectory_only"}:
+             raise ValueError("Folder mode supports 'standard' or 'csv_only'")
+         if self.mode == "trajectory_only":
+@@ -460,11 +514,13 @@
+         calibration_path = self.recording_dir / "calibration.json"
+         show_metrics = bool(self.cfg.get("runner", {}).get("visualization", {}).get("show_speed_direction", False))
+         homography = None
++        calibration_file = None
+         if show_metrics:
+             if not calibration_path.is_file():
+                 raise ValueError(f"Calibration file not found: {calibration_path}")
+             homography = load_speed_calibration(calibration_path)
+-            self.cfg["calibration_file"] = str(calibration_path)
++            calibration_file = str(calibration_path)
++            self.cfg["calibration_file"] = calibration_file
+             print(f"Loaded recording calibration once: {calibration_path}")
+ 
+         output_dir = self.recording_dir / "blurBall"
+@@ -473,9 +529,9 @@
+         if self.mode == "standard":
+             annotated_dir.mkdir(exist_ok=True)
+ 
+-        processor = VideoInferenceProcessor(self.cfg, self.model, homography)
+-        processed = skipped = 0
+-        failures = []
++        # Build the work list (skip already-complete segments).
++        work_items = []
++        skipped = 0
+         for index, segment in enumerate(segments, start=1):
+             csv_path = output_dir / f"{segment.stem}.csv"
+             video_path = annotated_dir / segment.name
+@@ -484,16 +540,56 @@
+                 skipped += 1
+                 print(f"[{index}/{len(segments)}] Skipping {segment.name}; outputs already exist")
+                 continue
+-            print(f"[{index}/{len(segments)}] Processing {segment.name}")
+-            try:
+-                processor.process(
+-                    segment, csv_path, self.mode,
+-                    annotated_video_path=video_path if self.mode == "standard" else None,
++            work_items.append(
++                (
++                    str(segment),
++                    str(csv_path),
++                    self.mode,
++                    str(video_path) if self.mode == "standard" else None,
++                    OmegaConf.to_container(self.cfg, resolve=True),
++                    calibration_file,
++                    index,
++                    len(segments),
+                 )
+-                processed += 1
+-            except Exception as exc:
+-                failures.append((segment.name, str(exc)))
+-                print(f"[{index}/{len(segments)}] Failed {segment.name}: {exc}")
++            )
++
++        processed = 0
++        failures = []
++
++        if self.num_parallel <= 1 or len(work_items) <= 1:
++            # Sequential path (original behaviour, shares one detector).
++            processor = VideoInferenceProcessor(self.cfg, self.model, homography)
++            for item in work_items:
++                segment_path, csv_path, mode, annotated_video_path, _, _, index, total = item
++                print(f"[{index}/{total}] Processing {Path(segment_path).name}")
++                try:
++                    processor.process(
++                        segment_path, csv_path, mode,
++                        annotated_video_path=annotated_video_path,
++                    )
++                    processed += 1
++                except Exception as exc:
++                    failures.append((Path(segment_path).name, str(exc)))
++                    print(f"[{index}/{total}] Failed {Path(segment_path).name}: {exc}")
++        else:
++            # Parallel path: each worker loads its own model copy.
++            print(
++                f"Processing {len(work_items)} segments with "
++                f"{self.num_parallel} parallel workers (ProcessPoolExecutor). "
++                f"Each worker loads a full model – watch GPU memory."
++            )
++            # "spawn" is required for CUDA + multiprocessing.
++            ctx = torch.multiprocessing.get_context("spawn")
++            with ProcessPoolExecutor(max_workers=self.num_parallel, mp_context=ctx) as executor:
++                futures = {executor.submit(_process_segment_worker, item): item for item in work_items}
++                for future in as_completed(futures):
++                    result = future.result()
++                    if result["status"] == "ok":
++                        processed += 1
++                        print(f"[{result['index']}/{len(segments)}] Finished {result['name']}")
++                    else:
++                        failures.append((result["name"], result["error"]))
++                        print(f"[{result['index']}/{len(segments)}] Failed {result['name']}: {result['error']}")
+ 
+         print(f"Processed: {processed}\nSkipped:   {skipped}\nFailed:    {len(failures)}")
+         for name, reason in failures:
