@@ -2,6 +2,10 @@ name: inference
 device: cuda
 gpus: [0]
 mode: standard
+# Number of segments to process in parallel via ProcessPoolExecutor.
+# 1 = sequential (default, shares one model). Values >1 load one model
+# per worker – keep this low (1–2) on a single GPU to avoid OOM.
+num_parallel_segments: 1
 keep_extracted_frames: true
 vis_result: True
 vis_hm: True
