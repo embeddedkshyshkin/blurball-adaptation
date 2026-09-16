@@ -22,10 +22,25 @@ the existing pipeline still uses unmodified. Outputs land under a sibling
 ever written to.
 
 Usage:
+    # whole recording, CSV only -- every segment that has a BlurBall CSV
+    python src/enrich_and_render.py --recording-dir <path> --no-video
+
+    # whole recording, CSV + HUD video (slower: decodes and re-encodes)
+    python src/enrich_and_render.py --recording-dir <path>
+
+    # named segment(s) only
     python src/enrich_and_render.py --recording-dir <path> --segment segment_000
-    python src/enrich_and_render.py --recording-dir <path> --segment segment_000 --no-video
+    python src/enrich_and_render.py --recording-dir <path> \\
+        --segment segment_000 segment_001 --no-video
+
+    # re-render one slice for a quick spot-check (CSV still covers the whole
+    # segment; --frame-range only limits the video)
     python src/enrich_and_render.py --recording-dir <path> --segment segment_000 \\
-        --frame-range 5900 6150   # render only this slice, for a quick spot-check
+        --frame-range 5900 6150
+
+Existing outputs are skipped unless ``--overwrite`` is given, so a batch can
+be re-run as the detector finishes more segments and only the new ones cost
+anything.
 """
 
 from __future__ import annotations
@@ -61,8 +76,56 @@ EXTENDED_COLUMNS = [
     "Source", "TrackId", "Xf", "Yf",
     "WorldX", "WorldY", "WorldZ", "Vx", "Vy", "Vz",
     "SpeedKmh", "ScreenDirDeg", "TableHeadingDeg",
-    "Confidence", "ScaleSource", "IsBounce",
+    "Confidence", "ScaleSource", "IsBounce", "BounceConfirmFrame", "PosSigmaPx",
+    "SpeedKmhRaw",
 ]
+
+# Above this the Kalman filter's own positional uncertainty says its
+# dead-reckoned position is not worth building anything on. Measured on
+# segment_000 against an independent detector (the desktop app's auto-label
+# sightings) and against re-acquisition innovations (n=4735):
+#
+#   first predicted frame  (sigma ~11) : median error   3.0px, 94% within 25px
+#   second predicted frame (sigma ~30) : median error 109.6px, 17% within 25px
+#
+# The cliff is real and it is not a model-choice artefact: coasting at
+# constant velocity instead of constant acceleration makes it worse (185.8px
+# at the second frame), because dropouts coincide with motion no kinematic
+# model can follow -- a blurred smash is ~130px/frame, and a racket contact
+# inside the gap is a velocity discontinuity by definition.
+#
+# So a row past this bar still reports its position (the user explicitly
+# asked for predicted positions in the CSV, marked as predicted), but it no
+# longer feeds a speed, a 3-D fit, a bounce search, or an on-video arrow.
+MAX_TRUSTED_POS_SIGMA_PX = 20.0
+
+# How far a detector CSV may fall short of the manifest's frame count before
+# it is treated as a half-written file rather than an end-of-stream quirk.
+# The two disagree by one frame legitimately -- segment_012 of the reference
+# recording has 10820 detector rows against a manifest frameCount of 10821,
+# with the detector finished -- while a CSV caught mid-write is short by
+# hundreds or thousands. 5 separates those without denying a good segment.
+MANIFEST_ROW_TOLERANCE = 5
+
+# Causal exponential smoothing of the *reported* speed.
+#
+# The raw number jitters +-20% frame to frame on a smoothly-varying arc,
+# which reads as broken on the video even when the mean is right. Measured on
+# the 5992-6021 lob: SpeedKmh and img_speed_px have identical variation
+# (cv 0.095, 7.1% median frame-to-frame) while z_hat is flat to 3 decimal
+# places (3.034-3.035 m), so every bit of the jitter is KF velocity noise and
+# none of it is the depth path.
+#
+# The filter itself is left alone: detuning Q to smooth velocity costs real
+# detections (see _GATE_CHI2's note), so the smoothing belongs on the readout.
+# alpha=0.3 is an effective ~3.3-frame window, cutting the jitter to about
+# 4% -- as smooth as the most detuned filter tried, with no coverage lost --
+# for ~2.3 frames (39ms) of lag. It is reset on a track change, on a
+# confirmed bounce and on any untrusted frame, so it never smooths across a
+# genuine velocity discontinuity; that lag-at-a-bounce was the original
+# complaint about the old non-causal estimator and is not worth reintroducing.
+# SpeedKmhRaw keeps the unsmoothed value for anyone who wants it.
+SPEED_EMA_ALPHA = 0.3
 
 HIST_LEN = 8
 MAX_PROPAGATE_GAP_FRAMES = 90  # ~1.5s at 60fps before a held depth is distrusted
@@ -73,6 +136,53 @@ MAX_PROPAGATE_GAP_FRAMES = 90  # ~1.5s at 60fps before a held depth is distruste
 # long predict-only KF coast (now damped, but this stays as a floor) reached
 # five-figure SpeedKmh. 150 km/h is well above any real table-tennis shot.
 MAX_PLAUSIBLE_SPEED_KMH = 150.0
+
+
+def _manifest_frame_count(recording_dir: Path, segment: str) -> int | None:
+    """Frame count this segment should have, from manifest.json, or None if
+    the manifest is missing/unreadable/silent about it."""
+    manifest_path = recording_dir / "manifest.json"
+    if not manifest_path.is_file():
+        return None
+    try:
+        manifest = json.loads(manifest_path.read_text())
+    except (OSError, ValueError):
+        return None
+    for seg in manifest.get("segments", []):
+        name = str(seg.get("fileName", ""))
+        if name.rsplit(".", 1)[0] == segment:
+            count = seg.get("frameCount")
+            return int(count) if isinstance(count, (int, float)) else None
+    return None
+
+
+def _video_looks_complete(video_out: Path, recording_dir: Path, segment: str) -> bool:
+    """True when an existing rendered video covers the whole segment.
+
+    A render interrupted part-way (Ctrl-C, OOM, a full disk) leaves a short
+    but perfectly readable mp4. Treating "the file exists" as "the video is
+    done" would make that partial result stick, silently, for every later
+    run -- and a whole-recording render is ~30 minutes, so being interrupted
+    is not a remote possibility. One frame-count check costs nothing on the
+    skip path and is the same reasoning as the manifest check on inputs.
+    """
+    if not video_out.is_file():
+        return False
+    expected = _manifest_frame_count(recording_dir, segment)
+    if expected is None:
+        return True  # nothing to compare against; take the file at face value
+    cap = cv2.VideoCapture(str(video_out))
+    try:
+        if not cap.isOpened():
+            return False
+        have = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    finally:
+        cap.release()
+    if expected - have > MANIFEST_ROW_TOLERANCE:
+        log.info("%s: existing video has %d of %d frames -- incomplete, "
+                 "re-rendering.", segment, have, expected)
+        return False
+    return True
 
 
 def _load_calibration(recording_dir: Path, fps_hint: float):
@@ -100,13 +210,40 @@ def process_segment(recording_dir: Path, segment: str, render_video: bool,
     out_dir = recording_dir / "blurBall_causal"
     out_dir.mkdir(exist_ok=True)
     csv_out = out_dir / f"{segment}.csv"
-    if csv_out.exists() and not overwrite and frame_range is None:
-        log.info("%s already exists; pass --overwrite to redo.", csv_out)
+    video_out = out_dir / "segments" / f"{segment}.mp4"
+    # Skip only when everything this invocation was asked for already exists.
+    # Keying the skip on the CSV alone silently broke the natural sequence of
+    # "enrich the whole recording with --no-video, then render the videos":
+    # the second pass saw the CSVs, skipped every segment and produced no
+    # video at all, exit 0. Asking for the video now re-runs the pass even
+    # though the CSV is there, and asking only for the CSV still costs
+    # nothing on a second run.
+    have_wanted = csv_out.exists() and (not render_video
+                                        or _video_looks_complete(video_out, recording_dir, segment))
+    if have_wanted and not overwrite and frame_range is None:
+        log.info("%s already has the requested output(s); pass --overwrite "
+                 "to redo.", segment)
         return csv_out
 
     df = pd.read_csv(csv_in)
     n = len(df)
     log.info("Loaded %d rows from %s", n, csv_in)
+
+    # Refuse a half-written input. The normal workflow is to enrich a whole
+    # recording while the detector is still working through it, so a segment's
+    # CSV may be mid-write when the glob picks it up. pandas reads a truncated
+    # file without complaint, and the short result would then be skipped on
+    # the next run (it exists), making the bad output sticky. manifest.json
+    # states each segment's true frame count, so compare and skip instead.
+    expected = _manifest_frame_count(recording_dir, segment)
+    if expected is not None and expected - n > MANIFEST_ROW_TOLERANCE:
+        log.warning("%s: %d rows but manifest says %d frames -- input looks "
+                    "incomplete (detector still running?); skipping. Re-run "
+                    "once it has finished.", segment, n, expected)
+        return csv_out
+    if expected is not None and n != expected:
+        log.info("%s: %d rows vs manifest %d -- within tolerance, proceeding.",
+                 segment, n, expected)
 
     cap = None
     fps_hint = 60.0
@@ -129,9 +266,7 @@ def process_segment(recording_dir: Path, segment: str, render_video: bool,
 
     writer = None
     if render_video and cap is not None:
-        seg_dir = out_dir / "segments"
-        seg_dir.mkdir(exist_ok=True)
-        video_out = seg_dir / f"{segment}.mp4"
+        video_out.parent.mkdir(exist_ok=True)
         w, h = frame_w, frame_h
         fourcc = cv2.VideoWriter_fourcc(*"mp4v")
         writer = cv2.VideoWriter(str(video_out), fourcc, fps, (w, h))
@@ -143,6 +278,7 @@ def process_segment(recording_dir: Path, segment: str, render_video: bool,
     arc_buffer: list[tuple[int, float, float]] = []
     anchor: BounceEvent | None = None
     last_good_depth: tuple[int, float] | None = None
+    speed_ema: float | None = None
 
     rows = []
     lo, hi = frame_range if frame_range else (0, n - 1)
@@ -159,6 +295,7 @@ def process_segment(recording_dir: Path, segment: str, render_video: bool,
             arc_buffer = []
             anchor = None
             last_good_depth = None
+            speed_ema = None
             prev_track_id = ts.track_id
 
         source = ts.source
@@ -171,7 +308,17 @@ def process_segment(recording_dir: Path, segment: str, render_video: bool,
         confidence = 0.0
         is_bounce_row = False
 
-        if source != "none":
+        # A measured frame is trustworthy by construction; a dead-reckoned one
+        # only while the filter's own uncertainty stays under the bar. An
+        # untrusted row is still emitted with its position and PosSigmaPx --
+        # it just stops propagating into anything downstream, including the
+        # history that feeds bounce detection and the 3-D arc buffer. Letting
+        # a 110px-wrong position into those was what put a visibly wrong ball
+        # and a jumping speed on the rendered video.
+        trusted = source == "measured" or (
+            source == "predicted" and ts.pos_sigma <= MAX_TRUSTED_POS_SIGMA_PX)
+
+        if trusted:
             hist_frames.append(i)
             hist_uv.append((ts.x, ts.y))
             if len(hist_frames) > HIST_LEN:
@@ -189,7 +336,32 @@ def process_segment(recording_dir: Path, segment: str, render_video: bool,
                 anchor = ev
                 kf.inflate_after_bounce()
                 arc_buffer = [(f, x, y) for f, (x, y) in zip(hist_frames, hist_uv) if f >= ev.frame]
-                is_bounce_row = True
+                # Mark the bounce on the frame it actually happened on
+                # (ev.frame, the image-v vertex), not on the frame we found
+                # out about it. detect_bounce_causal deliberately reports a
+                # lagged event -- it needs BOUNCE_CONFIRM_LAG frames on the
+                # far side of the peak before it can tell a bounce from
+                # noise -- so `i` here is the *confirmation* frame, typically
+                # vertex+2 but further when the history has gaps. Marking `i`
+                # put every bounce visibly late against the video, measured
+                # as a +2 mode (63 of 86 matched bounces on segment_000)
+                # versus the image-v vertex in an independent detector's
+                # trace. Backfilling by ev.frame rather than a constant -2
+                # also gets the gappy cases right.
+                #
+                # This backfills a marker into an already-computed row, which
+                # is fine precisely because it is only a marker: the CSV is
+                # written after the whole pass, and none of the kinematic
+                # columns are touched. The anchor itself is still applied
+                # strictly forward from this frame, so speed/direction/3-D on
+                # every row stay causal.
+                if 0 <= ev.frame < len(rows):
+                    rows[ev.frame]["IsBounce"] = True
+                    rows[ev.frame]["BounceConfirmFrame"] = i
+                else:
+                    is_bounce_row = True
+                # Speed genuinely steps across a bounce; don't smooth over it.
+                speed_ema = None
             else:
                 arc_buffer.append((i, ts.x, ts.y))
                 if len(arc_buffer) > MAX_FIT_WINDOW:
@@ -224,9 +396,22 @@ def process_segment(recording_dir: Path, segment: str, render_video: bool,
                     z_hat = float(cal.table_depth_at(np.array([ts.x, ts.y]))[0])
                     scale_source = "default"
                     confidence = 0.15
-                # ts.vx/vy (and hence img_speed_px) are already px/second: the
-                # KF's dt is real seconds, not frames. No extra *fps here.
-                speed_kmh = float(img_speed_px * z_hat / fx * 3.6)
+                if not math.isfinite(z_hat) or z_hat <= 0.0:
+                    # The ray through this pixel never meets the table plane
+                    # in front of the camera -- the ball is above the table's
+                    # horizon in the image, so this depth prior simply does
+                    # not apply. It is undefined, not negative: multiplying
+                    # by it produced 200 rows of negative km/h across
+                    # segments 000/001, every one of them on a perfectly
+                    # tracked frame (sigma 2.74), and the magnitude clamp
+                    # below only caught the ones past +-150. Report no speed
+                    # rather than a sign-flipped one.
+                    scale_source = "none"
+                    confidence = 0.0
+                else:
+                    # ts.vx/vy (and hence img_speed_px) are already px/second:
+                    # the KF's dt is real seconds, not frames. No extra *fps.
+                    speed_kmh = float(img_speed_px * z_hat / fx * 3.6)
 
             if abs(speed_kmh) > MAX_PLAUSIBLE_SPEED_KMH:
                 # abs(), not >: a diverged/near-parallel-to-table-plane ray
@@ -254,6 +439,19 @@ def process_segment(recording_dir: Path, segment: str, render_video: bool,
                 table_heading = None
                 scale_source = "none"
 
+        # Causal EMA on the reported speed -- see SPEED_EMA_ALPHA. Only a
+        # trusted row with a real speed feeds it; anything else drops the
+        # state so the next rally starts clean instead of easing out of a
+        # stale value.
+        speed_kmh_raw = speed_kmh
+        if trusted and speed_kmh > 0.0:
+            speed_ema = (speed_kmh if speed_ema is None
+                         else SPEED_EMA_ALPHA * speed_kmh
+                         + (1.0 - SPEED_EMA_ALPHA) * speed_ema)
+            speed_kmh = speed_ema
+        else:
+            speed_ema = None
+
         rows.append({
             "Frame": i, "X": r["X"], "Y": r["Y"], "Visibility": r["Visibility"],
             "L": r["L"], "Theta": r["Theta"],
@@ -272,20 +470,35 @@ def process_segment(recording_dir: Path, segment: str, render_video: bool,
             "Confidence": round(confidence, 3),
             "ScaleSource": scale_source,
             "IsBounce": is_bounce_row,
+            "BounceConfirmFrame": "",
+            "PosSigmaPx": round(ts.pos_sigma, 2) if math.isfinite(ts.pos_sigma) else "",
+            "SpeedKmhRaw": round(speed_kmh_raw, 2),
         })
 
         if writer is not None and lo <= i <= hi:
             ok, frame = cap.read()
             if not ok:
                 break
-            draw_radar_hud(frame, speed_kmh, heading_rad, source, confidence)
-            if source != "none":
+            # scale_source "none" means no depth was usable this frame, so
+            # there is no speed to show -- read "--" rather than "0", same
+            # reasoning as a suppressed prediction.
+            draw_radar_hud(frame, speed_kmh, heading_rad, source, confidence,
+                            trusted=trusted and scale_source != "none")
+            # Only mark a position the filter can actually defend. Gating on
+            # `source != "none"` drew a cross on every dead-reckoned frame,
+            # including the ones whose position is a median 369px from where
+            # an independent detector puts the ball -- that stray cross
+            # wandering off the ball is what "predicted balls is quite not
+            # accurate" was describing. An untrusted frame now draws no
+            # marker at all and the gauge collapses to a point, which is the
+            # honest statement: we do not know where the ball is.
+            if trusted:
                 colour = (60, 220, 60) if source == "measured" else (60, 160, 230)
-                marker = cv2.MARKER_CROSS if source == "predicted" else -1
-                if marker == -1:
+                if source == "measured":
                     cv2.circle(frame, (int(ts.x), int(ts.y)), 5, colour, 2, cv2.LINE_AA)
                 else:
-                    cv2.drawMarker(frame, (int(ts.x), int(ts.y)), colour, marker, 10, 2)
+                    cv2.drawMarker(frame, (int(ts.x), int(ts.y)), colour,
+                                    cv2.MARKER_CROSS, 10, 2)
             writer.write(frame)
         elif writer is not None:
             ok = cap.grab()
@@ -309,7 +522,10 @@ def process_segment(recording_dir: Path, segment: str, render_video: bool,
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--recording-dir", required=True, type=Path)
-    ap.add_argument("--segment", required=True, help="e.g. segment_000 (no extension)")
+    ap.add_argument("--segment", nargs="+", metavar="NAME",
+                     help="one or more segment names, e.g. --segment segment_000 "
+                          "segment_001 (no extension). Omit to process every "
+                          "segment in the recording that has a BlurBall CSV.")
     ap.add_argument("--no-video", action="store_true", help="write only the extended CSV")
     ap.add_argument("--frame-range", nargs=2, type=int, metavar=("START", "END"),
                      help="render only this inclusive frame range (CSV still covers the whole segment)")
@@ -327,8 +543,37 @@ def main():
         return 1
 
     frame_range = tuple(args.frame_range) if args.frame_range else None
-    process_segment(recording_dir, args.segment, render_video=not args.no_video,
-                     frame_range=frame_range, overwrite=args.overwrite)
+
+    if args.segment:
+        segments = list(args.segment)
+    else:
+        # Whole-recording batch: every segment the detector has produced a
+        # trajectory for. Segments still queued in the detector simply are
+        # not there yet, so this picks up whatever is ready and can be
+        # re-run later to fill in the rest.
+        segments = sorted(p.stem for p in (recording_dir / "blurBall").glob("*.csv"))
+        if not segments:
+            print(f"No BlurBall CSVs found in {recording_dir / 'blurBall'}",
+                  file=sys.stderr)
+            return 1
+        log.info("batch: %d segment(s) with a BlurBall CSV: %s",
+                 len(segments), ", ".join(segments))
+
+    failures = []
+    for name in segments:
+        try:
+            process_segment(recording_dir, name, render_video=not args.no_video,
+                             frame_range=frame_range, overwrite=args.overwrite)
+        except Exception as exc:  # one bad segment must not lose the batch
+            log.error("segment %s failed: %s", name, exc, exc_info=True)
+            failures.append(name)
+
+    if failures:
+        print(f"{len(failures)} of {len(segments)} segment(s) failed: "
+              f"{', '.join(failures)}", file=sys.stderr)
+        return 1
+    if len(segments) > 1:
+        log.info("batch complete: %d segment(s)", len(segments))
     return 0
 
 

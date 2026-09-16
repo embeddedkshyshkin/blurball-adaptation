@@ -23,13 +23,20 @@ POINT_RADIUS_PX = 6
 
 def draw_radar_hud(img, speed_kmh: float, heading_rad: float | None,
                     source: str, confidence: float,
-                    position: str = "top_center", max_arrow_len: int = 90) -> None:
+                    position: str = "top_center", max_arrow_len: int = 90,
+                    trusted: bool = True) -> None:
     """Mutates ``img`` in place. Always draws something -- a point at 0 km/h,
     growing to a full arrow at ``max_arrow_len`` px by ``MAX_SPEED_KMH``.
 
     ``source``: "measured" | "predicted" | "none" -- from the KF track state.
     ``confidence``: 0..1, from the 3-D fit's plausibility (0 when no 3-D fit
     is trusted; the number and arrow are still shown, just visually muted).
+
+    ``trusted``: False when the caller has suppressed this frame's estimate
+    (a dead-reckoned position the filter is no longer confident in). The
+    gauge still draws -- the indicator is always visible by design -- but it
+    reads "--" rather than "0", because 0 km/h asserts the ball is standing
+    still whereas the honest statement is that there is no reading.
     """
     h, w = img.shape[:2]
     scale = float(np.clip(w / 1100.0, 0.75, 1.6))
@@ -54,7 +61,7 @@ def draw_radar_hud(img, speed_kmh: float, heading_rad: float | None,
     speed_clamped = float(np.clip(speed_kmh, 0.0, MAX_SPEED_KMH))
     arrow_len = (speed_clamped / MAX_SPEED_KMH) * max_arrow_len * scale
 
-    is_live = source != "none"
+    is_live = source != "none" and trusted
     dim = source == "predicted" or confidence < 0.35
     colour = (0, 220, 255) if not dim else (0, 150, 190)
     halo = (255, 255, 255) if not dim else (170, 170, 170)
@@ -97,7 +104,9 @@ def draw_radar_hud(img, speed_kmh: float, heading_rad: float | None,
     unit_scale = 0.5 * scale
     cv2.putText(img, "km/h", (x0 + panel_w - int(52 * scale), ty), font, unit_scale,
                 (200, 200, 200), max(1, int(scale)), cv2.LINE_AA)
-    if source == "predicted":
+    if source == "predicted" and trusted:
+        # Only label it "predicted" when a prediction is actually being
+        # shown; on a suppressed frame there is nothing to qualify.
         cv2.putText(img, "predicted", (x0 + int(10 * scale), y0 + int(18 * scale)), font,
                     0.4 * scale, (150, 190, 210), 1, cv2.LINE_AA)
 

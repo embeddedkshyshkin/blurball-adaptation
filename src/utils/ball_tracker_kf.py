@@ -29,7 +29,23 @@ import numpy as np
 # chi-square critical value, 2 dof, p=0.999 -- a measurement further than this
 # from the predicted position (in units of its own uncertainty) is treated as
 # a tracking glitch rather than motion.
-_GATE_CHI2 = 13.8
+#
+# Raised from 13.8 (p=0.999) to 25.0 after measuring what the tighter gate
+# actually cost. Gate width and estimator smoothness are both driven by Q, so
+# they were conflated; opening the gate separately is a free win. Judged
+# against the desktop auto-label detector on segment_000 by the only metric
+# that nets retention against admitted outliers -- accepted frames that land
+# within 15px of the independent detector:
+#
+#   gate 13.8 : 4469 accepted, median err 1.20px, 3.6% >100px -> 4296 accurate
+#   gate 25.0 : 4579 accepted, median err 1.20px, 3.6% >100px -> 4405 accurate
+#
+# i.e. 110 more real detections kept, with the outlier rate and localisation
+# error both unchanged. Lowering jerk_std instead does reduce velocity noise
+# but rejects genuine detections (4171 accurate at 60k, 3654 at 25k), so the
+# speed jitter is handled downstream by a causal EMA on the reported number
+# rather than by detuning the filter that produces the positions.
+_GATE_CHI2 = 25.0
 
 # Process/measurement noise. ``dt`` is real seconds (1/fps), so state is
 # [pos_px, vel_px_per_s, accel_px_per_s^2] and jerk is px/s^3 -- NOT
@@ -85,6 +101,29 @@ _ACCEL_DECAY_PER_STEP = 0.90
 # whatever the derived speed happens to compute to. 500px is generous enough
 # that a ball genuinely leaving frame near an edge is not penalised.
 _BOUNDS_MARGIN_PX = 500.0
+
+# Prior spread on a *new* track's velocity/acceleration. reset() starts the
+# state at zero velocity, so these say how wrong that is allowed to be.
+#
+# The previous 20 px/s velocity seed was off by two orders of magnitude: a
+# rally ball crosses the frame at 1500-4000 px/s, so the filter began each
+# track almost certain the ball was standing still, and the chi-square gate
+# then rejected the very measurement that would have taught it the velocity.
+# Reproduced directly -- feed a fresh tracker two clean measurements 28px
+# apart and the second comes back "predicted", not "measured".
+#
+# 3000 px/s is ~8 m/s at this recording's depth/focal length (~30 km/h), so a
+# 100 km/h smash still sits inside 3 sigma. Swept on segment_000; every
+# metric improves together and then saturates, which is what fixing a bug
+# looks like rather than trading one off:
+#
+#   sigma_v   retention  restarts  steady median  steady p90  within 25px
+#      20        0.886      126        2.96          13.15       0.944
+#     800        0.918      118        2.92          12.01       0.953
+#    3000        0.918      120        2.91          12.16       0.952
+#
+_INIT_VEL_STD = 3000.0   # px/s
+_INIT_ACC_STD = 20000.0  # px/s^2 -- gravity plus racket impulse, generously
 
 
 def _cv_matrices(dt: float, jerk_std: float, meas_std: float):
@@ -148,7 +187,8 @@ class _AxisKF:
 
     def reset(self, pos: float):
         self.x = np.array([pos, 0.0, 0.0])
-        self.P = np.diag([_DEFAULT_MEAS_STD ** 2, 400.0, 4000.0])
+        self.P = np.diag([_DEFAULT_MEAS_STD ** 2,
+                          _INIT_VEL_STD ** 2, _INIT_ACC_STD ** 2])
         self.initialised = True
 
     def inflate(self, vel_var: float = 400.0, acc_var: float = 9000.0):
@@ -173,6 +213,21 @@ class TrackState:
     frames_since_update: int
     track_id: int
     track_age: int  # frames since this track (re)started
+    pos_sigma: float = float("inf")
+    """Filter's own 1-sigma positional uncertainty, sqrt(Px[0,0] + Py[0,0]) px.
+
+    This is the honest publish/suppress criterion for a dead-reckoned
+    position, and it is well calibrated: measured against the re-acquisition
+    innovation on segment_000 (n=4735), log(sigma) vs log(real error)
+    correlates at 0.796, and the bands are sharply separated --
+
+        sigma 10-20px : n=3818, median error  2.8px,  2% exceed 50px
+        sigma 20-40px : n= 183, median error 73.7px, 66% exceed 50px
+
+    -- so a threshold near 20 cleanly splits trustworthy predictions from
+    ones that should not drive a speed readout or a 3-D fit. Consumers get
+    the raw number so they can pick their own bar.
+    """
 
 
 class BallKalmanTracker2D:
@@ -207,6 +262,11 @@ class BallKalmanTracker2D:
     def alive(self) -> bool:
         return self._kx.initialised and self._frames_since_update <= self._max_gap
 
+    def _pos_sigma(self) -> float:
+        """1-sigma positional uncertainty in px -- see TrackState.pos_sigma."""
+        return float(np.sqrt(max(self._kx.P[0, 0], 0.0)
+                             + max(self._ky.P[0, 0], 0.0)))
+
     def step(self, frame: int, meas_xy: Optional[tuple[float, float]]) -> TrackState:
         if not self._kx.initialised:
             if meas_xy is None:
@@ -218,7 +278,8 @@ class BallKalmanTracker2D:
             self._track_id += 1
             self._track_age = 0
             return TrackState(frame, meas_xy[0], meas_xy[1], 0.0, 0.0, 0.0, 0.0,
-                               "measured", 0, self._track_id, 0)
+                               "measured", 0, self._track_id, 0,
+                               self._pos_sigma())
 
         if self._frames_since_update > self._max_gap:
             # Track has been dead-reckoning for too long: kill it. The next
@@ -263,6 +324,7 @@ class BallKalmanTracker2D:
             float(self._kx.x[1]), float(self._ky.x[1]),
             float(self._kx.x[2]), float(self._ky.x[2]),
             source, self._frames_since_update, self._track_id, self._track_age,
+            self._pos_sigma(),
         )
 
     def inflate_after_bounce(self):
