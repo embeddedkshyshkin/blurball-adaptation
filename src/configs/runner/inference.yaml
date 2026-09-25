@@ -6,6 +6,11 @@ mode: standard
 # 1 = sequential (default, shares one model). Values >1 load one model
 # per worker – keep this low (1–2) on a single GPU to avoid OOM.
 num_parallel_segments: 1
+# RAM pipeline (single video only for now): extract/model/post run as three
+# overlapping threads instead of the sequential disk-PNG path. Off by default;
+# the disk path is unchanged when this is false.
+use_ram_pipeline: false
+queue_maxsize: 128
 keep_extracted_frames: true
 vis_result: True
 vis_hm: True

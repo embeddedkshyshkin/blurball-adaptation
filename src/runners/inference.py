@@ -29,6 +29,7 @@ from utils.motion import MotionEstimator
 from utils.ball_kinematics import BallKinematicsEstimator, load_calibration
 
 from .base import BaseRunner
+from .ram_pipeline import RunControl, run_ram_pipeline
 
 
 def load_speed_calibration(calibration_file):
@@ -631,6 +632,10 @@ class NewVideosInferenceRunner(BaseRunner):
 
         if self._input_vid_path is None:
             raise ValueError("input_vid is required when input_folder is not provided")
+
+        if bool(self._cfg["runner"].get("use_ram_pipeline", False)):
+            return self._run_ram_pipeline(model=model)
+
         # Preserve the established single-video artifact layout and behavior.
         frame_dir = self._input_vid_path.parent / ("frames_" + self._input_vid_path.stem)
         frame_pngs = list(frame_dir.glob("*.png")) if frame_dir.is_dir() else []
@@ -687,3 +692,15 @@ class NewVideosInferenceRunner(BaseRunner):
             print(f"Trajectory retained: {traj_path}")
 
         return
+
+    def _run_ram_pipeline(self, model=None):
+        """RAM-resident path: extract/model/post overlap via threads and queues.
+
+        No PNGs touch disk. Vis/HUD rendering and folder mode are out of scope
+        here -- only the CSV (Frame, X, Y, Visibility, L, Theta) is produced.
+        """
+        detector = build_detector(self._cfg, model=model)
+        tracker = build_tracker(self._cfg)
+        traj_path = self._input_vid_path.with_name(self._input_vid_path.stem + "_traj.csv")
+        control = RunControl()
+        return run_ram_pipeline(detector, tracker, self._cfg, self._input_vid_path, traj_path, control=control)
