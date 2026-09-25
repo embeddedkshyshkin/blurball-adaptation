@@ -9,9 +9,8 @@ from pathlib import Path
 import time
 import logging
 from collections import defaultdict
-from concurrent.futures import ProcessPoolExecutor, as_completed
 from tqdm import tqdm
-from omegaconf import DictConfig, OmegaConf
+from omegaconf import DictConfig
 import hydra
 from hydra.core.hydra_config import HydraConfig
 import numpy as np
@@ -29,7 +28,7 @@ from utils.motion import MotionEstimator
 from utils.ball_kinematics import BallKinematicsEstimator, load_calibration
 
 from .base import BaseRunner
-from .ram_pipeline import RunControl, run_ram_pipeline
+from .ram_pipeline import RunControl, run_ram_pipeline, run_ram_pipeline_segments
 
 
 def load_speed_calibration(calibration_file):
@@ -424,55 +423,6 @@ class VideoInferenceProcessor:
             return result
 
 
-def _process_segment_worker(args):
-    """Top-level worker for ProcessPoolExecutor (must be picklable).
-
-    Each worker loads its own detector on the GPU. Keep
-    ``runner.num_parallel_segments`` modest (typically 1-2 on a single GPU)
-    to avoid VRAM exhaustion.
-    """
-    (
-        segment_path,
-        csv_path,
-        mode,
-        annotated_video_path,
-        cfg_container,
-        calibration_file,
-        index,
-        total,
-    ) = args
-
-    # Reconstruct a DictConfig so downstream code keeps working unchanged.
-    cfg = OmegaConf.create(cfg_container)
-    if calibration_file:
-        cfg["calibration_file"] = calibration_file
-
-    # Ensure CUDA is selected inside the child process.
-    if torch.cuda.is_available():
-        cfg["runner"]["device"] = "cuda"
-        cfg["runner"]["gpus"] = [0]
-
-    print(f"[{index}/{total}] [worker] Processing {Path(segment_path).name}")
-    try:
-        # Load model path from detector config if present; otherwise build_detector
-        # will use whatever is already configured.
-        processor = VideoInferenceProcessor(cfg, model=None, preloaded_speed_homography=None)
-        processor.process(
-            segment_path,
-            csv_path,
-            mode,
-            annotated_video_path=annotated_video_path,
-        )
-        return {"status": "ok", "name": Path(segment_path).name, "index": index}
-    except Exception as exc:
-        return {
-            "status": "error",
-            "name": Path(segment_path).name,
-            "index": index,
-            "error": str(exc),
-        }
-
-
 class RecordingInferenceRunner:
     """Process a PongEye recording folder segment-by-segment."""
 
@@ -484,14 +434,19 @@ class RecordingInferenceRunner:
         self.recording_dir = Path(cfg["input_folder"])
         self.mode = str(cfg["runner"].get("mode", "standard"))
         self.overwrite = bool(cfg.get("overwrite", False))
-        # Parallel segment processing (ProcessPoolExecutor). Default 1 = sequential.
-        self.num_parallel = int(cfg["runner"].get("num_parallel_segments", 1))
-        if self.num_parallel < 1:
-            raise ValueError("runner.num_parallel_segments must be >= 1")
+        self.use_ram_pipeline = bool(cfg["runner"].get("use_ram_pipeline", False))
+        self.num_segment_workers = int(cfg["runner"].get("num_segment_workers", 1))
+        if self.num_segment_workers < 1:
+            raise ValueError("runner.num_segment_workers must be >= 1")
         if self.mode not in {"standard", "csv_only", "trajectory_only"}:
             raise ValueError("Folder mode supports 'standard' or 'csv_only'")
         if self.mode == "trajectory_only":
             self.mode = "csv_only"
+        if self.use_ram_pipeline and self.mode != "csv_only":
+            raise ValueError(
+                "runner.use_ram_pipeline requires runner.mode='csv_only' "
+                "(or 'trajectory_only'); it does not render annotated video"
+            )
 
     @classmethod
     def discover_segments(cls, recording_dir):
@@ -504,7 +459,7 @@ class RecordingInferenceRunner:
             key=lambda path: path.name.lower(),
         )
 
-    def run(self):
+    def run(self, control=None, progress_cb=None):
         if not self.recording_dir.is_dir():
             raise ValueError(f"Recording folder not found: {self.recording_dir}")
         segments = self.discover_segments(self.recording_dir)
@@ -540,56 +495,51 @@ class RecordingInferenceRunner:
                 skipped += 1
                 print(f"[{index}/{len(segments)}] Skipping {segment.name}; outputs already exist")
                 continue
-            work_items.append(
-                (
-                    str(segment),
-                    str(csv_path),
-                    self.mode,
-                    str(video_path) if self.mode == "standard" else None,
-                    OmegaConf.to_container(self.cfg, resolve=True),
-                    calibration_file,
-                    index,
-                    len(segments),
-                )
-            )
+            work_items.append((segment, csv_path, video_path, index))
 
         processed = 0
         failures = []
 
-        if self.num_parallel <= 1 or len(work_items) <= 1:
+        if self.use_ram_pipeline and work_items:
+            # Segments run in waves of up to num_segment_workers, sharing one
+            # detector/model/GPU rather than one model copy per segment.
+            print(
+                f"Processing {len(work_items)} segments with the RAM pipeline, "
+                f"up to {self.num_segment_workers} in parallel (shared model)."
+            )
+            detector = build_detector(self.cfg, self.model)
+            ram_control = control or RunControl()
+            ram_segments = [
+                (str(segment.stem), str(segment), str(csv_path))
+                for segment, csv_path, _video_path, _index in work_items
+            ]
+            results = run_ram_pipeline_segments(
+                detector, self.cfg, ram_segments, control=ram_control, progress_cb=progress_cb
+            )
+            for segment, csv_path, _video_path, index in work_items:
+                status = results[str(segment.stem)]
+                if status["status"] == "ok":
+                    processed += 1
+                    print(f"[{index}/{len(segments)}] Finished {segment.name}")
+                elif status["status"] == "cancelled":
+                    print(f"[{index}/{len(segments)}] Cancelled {segment.name}")
+                else:
+                    failures.append((segment.name, str(status["error"])))
+                    print(f"[{index}/{len(segments)}] Failed {segment.name}: {status['error']}")
+        else:
             # Sequential path (original behaviour, shares one detector).
             processor = VideoInferenceProcessor(self.cfg, self.model, homography)
-            for item in work_items:
-                segment_path, csv_path, mode, annotated_video_path, _, _, index, total = item
-                print(f"[{index}/{total}] Processing {Path(segment_path).name}")
+            for segment, csv_path, video_path, index in work_items:
+                print(f"[{index}/{len(segments)}] Processing {segment.name}")
                 try:
                     processor.process(
-                        segment_path, csv_path, mode,
-                        annotated_video_path=annotated_video_path,
+                        str(segment), str(csv_path), self.mode,
+                        annotated_video_path=str(video_path) if self.mode == "standard" else None,
                     )
                     processed += 1
                 except Exception as exc:
-                    failures.append((Path(segment_path).name, str(exc)))
-                    print(f"[{index}/{total}] Failed {Path(segment_path).name}: {exc}")
-        else:
-            # Parallel path: each worker loads its own model copy.
-            print(
-                f"Processing {len(work_items)} segments with "
-                f"{self.num_parallel} parallel workers (ProcessPoolExecutor). "
-                f"Each worker loads a full model – watch GPU memory."
-            )
-            # "spawn" is required for CUDA + multiprocessing.
-            ctx = torch.multiprocessing.get_context("spawn")
-            with ProcessPoolExecutor(max_workers=self.num_parallel, mp_context=ctx) as executor:
-                futures = {executor.submit(_process_segment_worker, item): item for item in work_items}
-                for future in as_completed(futures):
-                    result = future.result()
-                    if result["status"] == "ok":
-                        processed += 1
-                        print(f"[{result['index']}/{len(segments)}] Finished {result['name']}")
-                    else:
-                        failures.append((result["name"], result["error"]))
-                        print(f"[{result['index']}/{len(segments)}] Failed {result['name']}: {result['error']}")
+                    failures.append((segment.name, str(exc)))
+                    print(f"[{index}/{len(segments)}] Failed {segment.name}: {exc}")
 
         print(f"Processed: {processed}\nSkipped:   {skipped}\nFailed:    {len(failures)}")
         for name, reason in failures:
@@ -700,7 +650,6 @@ class NewVideosInferenceRunner(BaseRunner):
         here -- only the CSV (Frame, X, Y, Visibility, L, Theta) is produced.
         """
         detector = build_detector(self._cfg, model=model)
-        tracker = build_tracker(self._cfg)
         traj_path = self._input_vid_path.with_name(self._input_vid_path.stem + "_traj.csv")
         control = RunControl()
-        return run_ram_pipeline(detector, tracker, self._cfg, self._input_vid_path, traj_path, control=control)
+        return run_ram_pipeline(detector, self._cfg, self._input_vid_path, traj_path, control=control)
