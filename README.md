@@ -154,6 +154,16 @@ Example:
 python src/main.py --config-name=inference_blurball detector.model_path=<path to corresponding model> detector.step=1 detector.postprocessor.score_threshold=0.7 +input_vid=<path_to_video> +calibration_file=<path_to_calibration.json>
 ```
 
+### RAM pipeline and desktop UI (faster inference)
+
+For BlurBall, `runner.use_ram_pipeline=true` runs extraction, model
+inference, and post-processing as overlapping threads instead of dumping
+every frame to disk first, and `runner.num_segment_workers` (1-6) processes
+several segments in parallel against one shared model. A tkinter app
+(`python src/ui/pipeline_app.py`) wraps this with Start/Pause/Resume/Cancel.
+See [`docs/pipeline_ui.md`](docs/pipeline_ui.md) for CLI flags, UI usage,
+and measured speedup numbers.
+
 ## Training
 Train BlurBall from scratch:
 
