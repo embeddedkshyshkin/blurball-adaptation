@@ -316,18 +316,29 @@ def _post_worker_seg(detector, cfg, seg_control, queue_b, csv_path, error_box, t
             # appear at buffer positions > 0, so they're finalized here.
             for fidx in sorted(pending.keys()):
                 finalize(fidx)
+
+        if seg_control.cancelled:
+            return  # no partial CSV on cancel or segment-local error
+
+        if not rows:
+            raise ValueError(
+                f"No complete window of {cfg['model']['frames_in']} frames "
+                f"(segment shorter than frames_in, or unreadable)"
+            )
+
+        df = pd.DataFrame(rows).sort_values("Frame").reset_index(drop=True)
+        tmp_path = Path(str(csv_path) + ".tmp")
+        df.to_csv(tmp_path, index=False)
+        tmp_path.replace(csv_path)
     except Exception as exc:
+        # Covers both the accumulation loop above and CSV writing: any
+        # failure here must be reported as this segment's error, not leave
+        # the thread to crash silently while the wave reports "ok" (that
+        # DataFrame().sort_values on an empty `rows` used to do exactly
+        # that -- KeyError escaped uncaught and the segment was still
+        # counted as processed).
         error_box[seg_id] = exc
         seg_control.local_cancel()
-        return
-
-    if seg_control.cancelled:
-        return  # no partial CSV on cancel or segment-local error
-
-    df = pd.DataFrame(rows).sort_values("Frame").reset_index(drop=True)
-    tmp_path = Path(str(csv_path) + ".tmp")
-    df.to_csv(tmp_path, index=False)
-    tmp_path.replace(csv_path)
 
 
 def _run_wave(detector, cfg, wave, control, progress_cb):
