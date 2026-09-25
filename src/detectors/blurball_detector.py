@@ -99,11 +99,32 @@ class BlurBallDetector(object):
     def input_wh(self):
         return self._input_wh
 
-    def run_tensor(self, imgs, affine_mats):
+    def run_model(self, imgs):
+        """GPU-only forward pass, no postprocessing."""
         imgs = imgs.to(self._device)
-        preds = self._model(imgs)
-        pp_results = self._postprocessor.run(preds, affine_mats)
+        return self._model(imgs)
 
+    def to_heatmaps(self, imgs, affine_mats):
+        """Forward pass + sigmoid/transfer, stopping before blob detection.
+
+        Lets a RAM-pipeline model thread hand heatmaps to a separate CPU-bound
+        post thread instead of also running blob detection itself.
+        """
+        preds = self.run_model(imgs)
+        return self._postprocessor.to_heatmaps(preds, affine_mats)
+
+    def results_from_heatmaps(self, hms, affine_np):
+        """CPU-only blob detection + reformatting, given ``to_heatmaps`` output."""
+        pp_results = self._postprocessor.from_heatmaps(hms, affine_np)
+        return self._format_results(pp_results)
+
+    def run_tensor(self, imgs, affine_mats):
+        preds = self.run_model(imgs)
+        pp_results = self._postprocessor.run(preds, affine_mats)
+        return self._format_results(pp_results)
+
+    @staticmethod
+    def _format_results(pp_results):
         results = {}
         hms_vis = {}
         for bid in sorted(pp_results.keys()):

@@ -81,12 +81,25 @@ class BlurBallPostprocessor(object):
                 scores.append(score)
         return xys, angles, ls, scores
 
-    def run(self, preds, affine_mats):
+    def to_heatmaps(self, preds, affine_mats):
+        """GPU/device part of ``run``: sigmoid + transfer to CPU numpy.
+
+        Split out so the RAM pipeline's model thread can hand heatmaps to a
+        separate post thread instead of also doing blob detection itself.
+        """
+        hms = {}
+        affine_np = {}
+        for scale in self._scales:
+            affine_np[scale] = affine_mats[scale].cpu().numpy()
+            hms[scale] = preds[scale].sigmoid_().cpu().numpy()
+        return hms, affine_np
+
+    def from_heatmaps(self, hms, affine_np):
+        """CPU part of ``run``: blob detection over already-transferred heatmaps."""
         results = defaultdict(lambda: defaultdict(dict))
         for scale in self._scales:
-            preds_ = preds[scale]
-            affine_mats_ = affine_mats[scale].cpu().numpy()
-            hms_ = preds_.sigmoid_().cpu().numpy()
+            affine_mats_ = affine_np[scale]
+            hms_ = hms[scale]
 
             b, s, h, w = hms_.shape
             for i in range(b):
@@ -130,3 +143,7 @@ class BlurBallPostprocessor(object):
 
         # print(results)
         return results
+
+    def run(self, preds, affine_mats):
+        hms, affine_np = self.to_heatmaps(preds, affine_mats)
+        return self.from_heatmaps(hms, affine_np)

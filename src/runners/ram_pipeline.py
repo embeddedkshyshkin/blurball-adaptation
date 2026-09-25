@@ -8,7 +8,10 @@ sequentially through a directory of extracted PNGs (see ``inference_video`` in
 Preprocessing (affine transform, resize/normalize) and the windowing/step logic
 are copied 1:1 from ``inference_video`` so the CSV this produces matches the
 disk-based path frame for frame. The postprocessor math (x/y/L/theta) itself is
-untouched -- it already runs inside ``detector.run_tensor``.
+untouched: the model thread does sigmoid + GPU->CPU transfer only
+(``detector.to_heatmaps``) and hands heatmaps to the post thread, which runs
+blob detection (``detector.results_from_heatmaps``) -- the same CPU-bound work
+``detector.run_tensor`` does inline, just moved off the shared GPU thread.
 """
 import queue
 import threading
@@ -153,6 +156,8 @@ def _extract_worker(video_path, cfg, control, queue_a, error_box, timing):
 
 
 def _model_worker(detector, control, queue_a, queue_b, error_box, timing):
+    """GPU-only: forward pass + sigmoid/transfer. Blob detection runs downstream
+    in the post thread so the shared model thread spends less time per window."""
     try:
         with torch.no_grad():
             while not control.cancelled:
@@ -163,13 +168,12 @@ def _model_worker(detector, control, queue_a, queue_b, error_box, timing):
                 if control.cancelled:
                     break
                 t0 = time.time()
-                batch_results, _hms_vis = detector.run_tensor(item["tensor"], item["affine"])
+                hms, affine_np = detector.to_heatmaps(item["tensor"], item["affine"])
                 timing["t_model"] += time.time() - t0
-                num_positions = len(item["frame_indices"])
-                preds_per_pos = [batch_results[0].get(pos, []) for pos in range(num_positions)]
                 out_item = {
                     "frame_indices": item["frame_indices"],
-                    "preds_per_pos": preds_per_pos,
+                    "hms": hms,
+                    "affine_np": affine_np,
                 }
                 if not _put_with_cancel(queue_b, out_item, control):
                     break
@@ -180,7 +184,8 @@ def _model_worker(detector, control, queue_a, queue_b, error_box, timing):
         _put_sentinel(queue_b)
 
 
-def _post_worker(tracker, cfg, control, queue_b, csv_path, error_box, timing):
+def _post_worker(detector, tracker, cfg, control, queue_b, csv_path, error_box, timing):
+    """CPU-only: blob detection over heatmaps from Queue B, then tracker + CSV."""
     step = cfg["detector"]["step"]
     model_name = cfg["model"]["name"]
     tracker.refresh()
@@ -212,7 +217,10 @@ def _post_worker(tracker, cfg, control, queue_b, csv_path, error_box, timing):
             if control.cancelled:
                 break
             frame_indices = item["frame_indices"]
-            preds_per_pos = item["preds_per_pos"]
+            t0 = time.time()
+            batch_results, _hms_vis = detector.results_from_heatmaps(item["hms"], item["affine_np"])
+            timing["t_post"] += time.time() - t0
+            preds_per_pos = [batch_results[0].get(pos, []) for pos in range(len(frame_indices))]
             for pos, fidx in enumerate(frame_indices):
                 pending.setdefault(fidx, []).extend(preds_per_pos[pos])
             if step == 3:
@@ -272,7 +280,7 @@ def run_ram_pipeline(detector, tracker, cfg, input_video_path, traj_output_path,
         ),
         threading.Thread(
             target=_post_worker,
-            args=(tracker, cfg, control, queue_b, traj_output_path, error_box, timing),
+            args=(detector, tracker, cfg, control, queue_b, traj_output_path, error_box, timing),
             name="ram-pipeline-post",
             daemon=True,
         ),
